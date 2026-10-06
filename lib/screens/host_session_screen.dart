@@ -356,6 +356,156 @@ class _HostSessionScreenState
           File(result.files.first.path!),
     );
   }
+  Future<bool> _resetExperimentOnServer() async {
+    try {
+      final base = widget.mqttService.serverUrl;
+      final url = Uri.parse('$base/admin/reset_experiment');
+
+      final response = await http.post(url);
+
+      if (response.statusCode == 200) {
+        return true;
+      }
+
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _resetExperiment() async {
+    if (_isProcessingDistribution) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Cannot reset while distribution is in progress',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Reset Experiment'),
+        content: const Text(
+          'This will clear the current experiment metrics, '
+          'scheduler logs, assignments, and progress. '
+          'Connection settings, connected clients, selected model/dataset, '
+          'and scheduling configuration will be preserved.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Reset Experiment'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    final ok = await _resetExperimentOnServer();
+
+    if (!mounted) return;
+
+    if (ok) {
+      setState(() {
+        _jobProgress = {};
+        _perClientQueues = {};
+        _recentResults = {};
+        _modelWarmupReceived = false;
+        _modelWarmupTtprocMs = null;
+        _modelWarmupBwKbps = null;
+        _distributionStep = DistributionStep.idle;
+        _ackedModelIps.clear();
+        _ackedDataIps.clear();
+        _showModelIps = false;
+        _showDataIps = false;
+      });
+
+      _stopJobStatusPolling();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Experiment reset successfully',
+          ),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Failed to reset experiment',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _downloadMetrics() async {
+    try {
+      final base = widget.mqttService.serverUrl;
+      final url = Uri.parse('$base/admin/metrics');
+
+      final response = await http.get(url);
+
+      if (response.statusCode != 200) {
+        if (!mounted) return;
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Failed to retrieve experiment metrics',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final defaultFileName =
+          'experiment_metrics_${DateTime.now().millisecondsSinceEpoch}.txt';
+
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Experiment Metrics',
+        fileName: defaultFileName,
+        type: FileType.custom,
+        allowedExtensions: ['txt'],
+        bytes: response.bodyBytes,
+      );
+
+      if (!mounted) return;
+
+      if (savedPath != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Metrics saved to $savedPath',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Error downloading metrics: $e',
+          ),
+        ),
+      );
+    }
+  }
+
   Future<void> _submitDistribution() async {
     if (
       widget.mqttService
@@ -389,6 +539,23 @@ class _HostSessionScreenState
       }
       return;
     }
+    // Every click of Submit & Start Distribution begins a new experiment.
+    // Reset experiment-specific server state before sending the model/dataset.
+    final resetOk = await _resetExperimentOnServer();
+
+    if (!mounted) return;
+
+    if (!resetOk) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Failed to initialize a new experiment',
+          ),
+        ),
+      );
+      return;
+    }
+
     setState(() {
       _isProcessingDistribution = true;
       _distributionStep =
@@ -397,7 +564,15 @@ class _HostSessionScreenState
       _ackedDataIps.clear();
       _showModelIps = false;
       _showDataIps = false;
+      _jobProgress = {};
+      _perClientQueues = {};
+      _recentResults = {};
+      _modelWarmupReceived = false;
+      _modelWarmupTtprocMs = null;
+      _modelWarmupBwKbps = null;
     });
+
+    _stopJobStatusPolling();
     // 1) Share model (broadcast)
     final modelSent =
         await widget.mqttService.shareFileToTopic(
@@ -595,6 +770,10 @@ class _HostSessionScreenState
           }
         } catch (_) {}
       }
+      // The reset marks registered jobs inactive. Reactivate the
+      // dataset job for this newly submitted experiment.
+      distributionManager.activateJob(jobId);
+
       // post job options
       try {
         final optsUrl =
@@ -2353,7 +2532,77 @@ class _HostSessionScreenState
               ),
             ),
           ],
-        ],
+          // Experiment actions
+          if (widget.mqttService.isBrokerRunning) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 24,
+              ),
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 8),
+                  const Divider(height: 1),
+                  const SizedBox(height: 20),
+                  Text(
+                    'Experiment',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleLarge,
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed:
+                              _isProcessingDistribution
+                                  ? null
+                                  : _resetExperiment,
+                          icon: const Icon(
+                            Icons.restart_alt,
+                          ),
+                          label: const Text(
+                            'Reset Experiment',
+                          ),
+                          style:
+                              OutlinedButton.styleFrom(
+                            padding:
+                                const EdgeInsets.symmetric(
+                              vertical: 14,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed:
+                              _downloadMetrics,
+                          icon: const Icon(
+                            Icons.download,
+                          ),
+                          label: const Text(
+                            'Download Metrics',
+                          ),
+                          style:
+                              ElevatedButton.styleFrom(
+                            padding:
+                                const EdgeInsets.symmetric(
+                              vertical: 14,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                ],
+              ),
+            ),
+          ],
+          ],
       ),
     );
   }

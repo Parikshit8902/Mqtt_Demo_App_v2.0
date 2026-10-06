@@ -1,168 +1,340 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:path/path.dart' as path;
 import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:uuid/uuid.dart';
 import 'package:archive/archive.dart';
+
 import 'message_logger.dart';
 import 'distribution_singleton.dart';
 import 'models/result_dto.dart';
 import 'models/assignment.dart';
 import 'network_helper.dart';
 
-/// Manages the HTTP file server for sharing files between devices
+/// Manages the HTTP file server for sharing files between devices.
+///
+/// In addition to file sharing, this service maintains experiment-specific
+/// scheduling/result information and exposes endpoints for:
+/// - resetting the current experiment
+/// - downloading metrics for the current experiment
 class FileServerService {
   final MessageLogger _logger;
   final Function()? _onStateChanged;
   final Map<String, _SharedFile> _sharedFiles = {};
-  
+
   HttpServer? _server;
   bool _isServerRunning = false;
   final int _port = 8080;
   String _serverIp = '';
   String _networkAccessibleIp = '';
-  
-  FileServerService(this._logger, {Function()? onStateChanged}) 
-    : _onStateChanged = onStateChanged;
-  
-  // Getters
+
+  FileServerService(
+    this._logger, {
+    Function()? onStateChanged,
+  }) : _onStateChanged = onStateChanged;
+
+  // ---------------------------------------------------------------------------
+  // SERVER GETTERS
+  // ---------------------------------------------------------------------------
+
   bool get isServerRunning => _isServerRunning;
+
   String get serverUrl => 'http://$_serverIp:$_port';
-  String get networkServerUrl => 'http://$_networkAccessibleIp:$_port';
+
+  String get networkServerUrl =>
+      'http://$_networkAccessibleIp:$_port';
+
   int get serverPort => _port;
+
   String get serverIp => _serverIp;
+
   String get networkAccessibleIp => _networkAccessibleIp;
-  
-  /// Start the HTTP file server
+
+  // ---------------------------------------------------------------------------
+  // EXPERIMENT-SPECIFIC STATE
+  // ---------------------------------------------------------------------------
+
+  /// In-memory store for warmup reports keyed by client id.
+  ///
+  /// Warmup information is intentionally preserved across experiments because
+  /// it represents client/network characteristics rather than experiment
+  /// results.
+  final Map<String, Map<String, dynamic>> _warmupReports = {};
+
+  /// In-memory scheduler logs for the current experiment.
+  ///
+  /// These are reset when a new experiment starts.
+  final List<Map<String, dynamic>> _schedulerLogs = [];
+
+  /// In-memory result reports for the current experiment.
+  ///
+  /// Keyed by job id.
+  final Map<String, List<Map<String, dynamic>>>
+      _resultReportsByJob = {};
+
+  /// Per-job default units to assign when clients request next.
+  ///
+  /// This is considered configuration rather than experiment-result state,
+  /// therefore it is preserved when an experiment is reset.
+  final Map<String, int> _jobDefaultUnits = {};
+
+  // ---------------------------------------------------------------------------
+  // SERVER MANAGEMENT
+  // ---------------------------------------------------------------------------
+
+  /// Start the HTTP file server.
   Future<bool> startServer(String ip) async {
     if (_isServerRunning) {
       _logger.log('📡 File server is already running');
       return true;
     }
-    
+
     _serverIp = ip;
     _logger.log('🚀 Starting HTTP file server...');
-    
+
     try {
-      // Get the network-accessible IP address
-      _networkAccessibleIp = await _getNetworkAccessibleIp(ip);
-      _logger.log('🌐 Network accessible IP: $_networkAccessibleIp');
-      
-      // Create a router for handling requests
+      // Get the network-accessible IP address.
+      _networkAccessibleIp =
+          await _getNetworkAccessibleIp(ip);
+
+      _logger.log(
+        '🌐 Network accessible IP: $_networkAccessibleIp',
+      );
+
+      // Create a router for handling requests.
       final router = Router();
-      
-      // Route for getting file info
-      router.get('/files/<fileId>/info', _handleFileInfoRequest);
-      
-      // Route for downloading files
-      router.get('/files/<fileId>', _handleFileDownloadRequest);
-      
-    // Route for listing available files
-    router.get('/files', _handleListFilesRequest);
-  // Admin: set job options (e.g. default max units per assignment)
-  router.post('/admin/job_options', _handleSetJobOptions);
-  // Admin endpoints for warmup reporting
-  router.post('/admin/warmup', _handleWarmupReport);
-  router.get('/admin/warmup', _handleWarmupStatus);
-  // Job status endpoint
-  router.get('/admin/job_status', _handleJobStatus);
-  // Scheduler logs endpoint
-  router.get('/admin/scheduler_logs', _handleSchedulerLogs);
-  // Assignment endpoints for distributed jobs
-  router.get('/assignments/<jobId>/for/<clientId>', _handleGetAssignmentForClient);
-  router.get('/assignments/<jobId>/next', _handleGetNextAssignment);
-  router.post('/assignments/<jobId>/results', _handlePostResultReport);
-      
-      // Create a shelf handler with logging
+
+      // -----------------------------------------------------------------------
+      // FILE SHARING
+      // -----------------------------------------------------------------------
+
+      // Route for getting file info.
+      router.get(
+        '/files/<fileId>/info',
+        _handleFileInfoRequest,
+      );
+
+      // Route for downloading files.
+      router.get(
+        '/files/<fileId>',
+        _handleFileDownloadRequest,
+      );
+
+      // Route for listing available files.
+      router.get(
+        '/files',
+        _handleListFilesRequest,
+      );
+
+      // -----------------------------------------------------------------------
+      // ADMIN / EXPERIMENT MANAGEMENT
+      // -----------------------------------------------------------------------
+
+      // Set job options such as default max units per assignment.
+      router.post(
+        '/admin/job_options',
+        _handleSetJobOptions,
+      );
+
+      // Warmup reporting.
+      router.post(
+        '/admin/warmup',
+        _handleWarmupReport,
+      );
+
+      router.get(
+        '/admin/warmup',
+        _handleWarmupStatus,
+      );
+
+      // Job status.
+      router.get(
+        '/admin/job_status',
+        _handleJobStatus,
+      );
+
+      // Scheduler logs.
+      router.get(
+        '/admin/scheduler_logs',
+        _handleSchedulerLogs,
+      );
+
+      // Reset experiment-specific state.
+      router.post(
+        '/admin/reset_experiment',
+        _handleResetExperiment,
+      );
+
+      // Download metrics for the current experiment.
+      router.get(
+        '/admin/metrics',
+        _handleDownloadMetrics,
+      );
+
+      // -----------------------------------------------------------------------
+      // DISTRIBUTED JOB ENDPOINTS
+      // -----------------------------------------------------------------------
+
+      router.get(
+        '/assignments/<jobId>/for/<clientId>',
+        _handleGetAssignmentForClient,
+      );
+
+      router.get(
+        '/assignments/<jobId>/next',
+        _handleGetNextAssignment,
+      );
+
+      router.post(
+        '/assignments/<jobId>/results',
+        _handlePostResultReport,
+      );
+
+      // -----------------------------------------------------------------------
+      // SERVER
+      // -----------------------------------------------------------------------
+
       final logMiddleware = shelf.logRequests();
+
       final handler = shelf.Pipeline()
           .addMiddleware(logMiddleware)
           .addHandler(router.call);
-      
-      // Start the server - bind to any IPv4 address to ensure it's accessible from the network
-      _logger.log('🔧 Creating HTTP server on 0.0.0.0:$_port (accessible via $_networkAccessibleIp)');
+
+      _logger.log(
+        '🔧 Creating HTTP server on '
+        '0.0.0.0:$_port '
+        '(accessible via $_networkAccessibleIp)',
+      );
+
       _server = await shelf_io.serve(
         handler,
-        InternetAddress.anyIPv4, // Bind to any address so it's accessible from the network
+        InternetAddress.anyIPv4,
         _port,
         shared: true,
       );
-      
+
       _isServerRunning = true;
-      _logger.log('✅ HTTP file server started on $_networkAccessibleIp:$_port');
+
+      _logger.log(
+        '✅ HTTP file server started on '
+        '$_networkAccessibleIp:$_port',
+      );
+
       if (_onStateChanged != null) {
         _onStateChanged();
       }
+
       return true;
     } catch (e) {
-      _logger.log('❌ Failed to start HTTP file server: $e');
+      _logger.log(
+        '❌ Failed to start HTTP file server: $e',
+      );
       return false;
     }
   }
-  
-  /// Get the network-accessible IP address
-  Future<String> _getNetworkAccessibleIp(String ip) async {
-    // If the IP is already a valid network IP (not localhost), use it
-    if (ip != '127.0.0.1' && ip != 'localhost') {
+
+  /// Get the network-accessible IP address.
+  Future<String> _getNetworkAccessibleIp(
+    String ip,
+  ) async {
+    // If the IP is already a valid network IP
+    // (not localhost), use it.
+    if (ip != '127.0.0.1' &&
+        ip != 'localhost') {
       return ip;
     }
-    
-    // Try to get the device's IP address
-    final deviceIp = await NetworkHelper.getDeviceIPAddress();
+
+    // Try to get the device's IP address.
+    final deviceIp =
+        await NetworkHelper.getDeviceIPAddress();
+
     if (deviceIp != null) {
-      _logger.log('🔍 Found device IP: $deviceIp');
+      _logger.log(
+        '🔍 Found device IP: $deviceIp',
+      );
       return deviceIp;
     }
-    
-    // If we can't find a valid IP, default to the input IP
-    _logger.log('⚠️ Could not determine network IP, using: $ip');
+
+    // If we can't find a valid IP, default to
+    // the input IP.
+    _logger.log(
+      '⚠️ Could not determine network IP, '
+      'using: $ip',
+    );
+
     return ip;
   }
-  
-  /// Stop the HTTP file server
+
+  /// Stop the HTTP file server.
   Future<void> stopServer() async {
-    _logger.log('🛑 Stopping HTTP file server...');
-    
+    _logger.log(
+      '🛑 Stopping HTTP file server...',
+    );
+
     try {
       if (_server != null) {
         await _server!.close(force: true);
         _server = null;
       }
-      
+
       _isServerRunning = false;
       _sharedFiles.clear();
-      _logger.log('✅ HTTP file server stopped');
+
+      _logger.log(
+        '✅ HTTP file server stopped',
+      );
+
       if (_onStateChanged != null) {
         _onStateChanged();
       }
     } catch (e) {
-      _logger.log('❌ Error stopping HTTP file server: $e');
+      _logger.log(
+        '❌ Error stopping HTTP file server: $e',
+      );
     }
   }
-  
-  /// Share a file and get a unique URL for it
-  Future<FileShareInfo?> shareFile(File file) async {
-    // Clear previous shared files so only the latest file is available
+
+  // ---------------------------------------------------------------------------
+  // FILE SHARING
+  // ---------------------------------------------------------------------------
+
+  /// Share a file and get a unique URL for it.
+  Future<FileShareInfo?> shareFile(
+    File file,
+  ) async {
+    // Clear previous shared files so only the latest
+    // file is available.
     _sharedFiles.clear();
+
     if (!_isServerRunning) {
-      _logger.log('❌ Cannot share file - server not running');
+      _logger.log(
+        '❌ Cannot share file - server not running',
+      );
       return null;
     }
-    
+
     try {
       final fileId = const Uuid().v4();
       final fileName = path.basename(file.path);
       final fileSize = await file.length();
-      final fileExtension = path.extension(file.path).toLowerCase();
-      final mimeType = _getMimeType(fileExtension);
-      
-      _logger.log('📂 Preparing to share file: $fileName');
-      _logger.log('📊 File size: ${_formatFileSize(fileSize)}');
-      
-      // Store file information
+      final fileExtension =
+          path.extension(file.path).toLowerCase();
+      final mimeType =
+          _getMimeType(fileExtension);
+
+      _logger.log(
+        '📂 Preparing to share file: $fileName',
+      );
+
+      _logger.log(
+        '📊 File size: ${_formatFileSize(fileSize)}',
+      );
+
+      // Store file information.
       _sharedFiles[fileId] = _SharedFile(
         id: fileId,
         file: file,
@@ -171,10 +343,14 @@ class FileServerService {
         mimeType: mimeType,
         dateAdded: DateTime.now(),
       );
-      
-      final url = '$serverUrl/files/$fileId';
-      _logger.log('🔗 File available at: $url');
-      
+
+      final url =
+          '$serverUrl/files/$fileId';
+
+      _logger.log(
+        '🔗 File available at: $url',
+      );
+
       return FileShareInfo(
         fileId: fileId,
         fileName: fileName,
@@ -183,557 +359,1925 @@ class FileServerService {
         url: url,
       );
     } catch (e) {
-      _logger.log('❌ Error sharing file: $e');
+      _logger.log(
+        '❌ Error sharing file: $e',
+      );
       return null;
     }
   }
-  
-  /// Handle file info request
-  Future<shelf.Response> _handleFileInfoRequest(shelf.Request request, String fileId) async {
-    _logger.log('📝 File info requested for ID: $fileId');
-    
+
+  /// Handle file info request.
+  Future<shelf.Response> _handleFileInfoRequest(
+    shelf.Request request,
+    String fileId,
+  ) async {
+    _logger.log(
+      '📝 File info requested for ID: $fileId',
+    );
+
     if (!_sharedFiles.containsKey(fileId)) {
-      _logger.log('❌ File not found: $fileId');
-      return shelf.Response.notFound('File not found');
+      _logger.log(
+        '❌ File not found: $fileId',
+      );
+
+      return shelf.Response.notFound(
+        'File not found',
+      );
     }
-    
-    final sharedFile = _sharedFiles[fileId]!;
-    
+
+    final sharedFile =
+        _sharedFiles[fileId]!;
+
     return shelf.Response.ok(
       jsonEncode({
         'id': sharedFile.id,
         'name': sharedFile.name,
         'size': sharedFile.size,
         'mimeType': sharedFile.mimeType,
-        'dateAdded': sharedFile.dateAdded.toIso8601String(),
+        'dateAdded':
+            sharedFile.dateAdded.toIso8601String(),
       }),
-      headers: {'Content-Type': 'application/json'},
+      headers: {
+        'Content-Type': 'application/json',
+      },
     );
   }
-  
-  /// Handle file download request
-  Future<shelf.Response> _handleFileDownloadRequest(shelf.Request request, String fileId) async {
-    _logger.log('📥 File download requested for ID: $fileId');
-    
+
+  /// Handle file download request.
+  Future<shelf.Response> _handleFileDownloadRequest(
+    shelf.Request request,
+    String fileId,
+  ) async {
+    _logger.log(
+      '📥 File download requested for ID: $fileId',
+    );
+
     if (!_sharedFiles.containsKey(fileId)) {
-      _logger.log('❌ File not found: $fileId');
-      return shelf.Response.notFound('File not found');
+      _logger.log(
+        '❌ File not found: $fileId',
+      );
+
+      return shelf.Response.notFound(
+        'File not found',
+      );
     }
-    
-    final sharedFile = _sharedFiles[fileId]!;
+
+    final sharedFile =
+        _sharedFiles[fileId]!;
     final file = sharedFile.file;
-    // Support serving a specific entry from a ZIP via ?entry=<name>
-    final entryParam = request.url.queryParameters['entry'];
-    if (entryParam != null && entryParam.isNotEmpty && (sharedFile.mimeType == 'application/zip' || sharedFile.name.toLowerCase().endsWith('.zip'))) {
+
+    // Support serving a specific entry from a ZIP
+    // via ?entry=<name>.
+    final entryParam =
+        request.url.queryParameters['entry'];
+
+    if (entryParam != null &&
+        entryParam.isNotEmpty &&
+        (sharedFile.mimeType ==
+                'application/zip' ||
+            sharedFile.name
+                .toLowerCase()
+                .endsWith('.zip'))) {
       try {
-        final entryName = Uri.decodeComponent(entryParam);
-        final bytes = await file.readAsBytes();
-        final archive = ZipDecoder().decodeBytes(bytes);
-        final af = archive.files.firstWhere((f) => f.name == entryName, orElse: () => ArchiveFile('', 0, null));
-        if (af.name.isEmpty || af.content == null) {
-          _logger.log('❌ Entry not found in archive: $entryName');
-          return shelf.Response.notFound('Entry not found');
-        }
-        final entryBytes = (af.content as List<int>);
-        // Range support for entry bytes
-        final rangeHeader = request.headers['range'];
-        if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
-          final parts = rangeHeader.substring(6).split('-');
-          int start = int.parse(parts[0]);
-          int end = parts.length > 1 && parts[1].isNotEmpty ? int.parse(parts[1]) : entryBytes.length - 1;
-          if (end >= entryBytes.length) end = entryBytes.length - 1;
-          final chunk = entryBytes.sublist(start, end + 1);
-          return shelf.Response(206, body: Stream.fromIterable([chunk]), headers: {
-            'Content-Type': _getMimeType(path.extension(af.name).toLowerCase()),
-            'Content-Length': chunk.length.toString(),
-            'Content-Range': 'bytes $start-$end/${entryBytes.length}',
-            'Content-Disposition': 'attachment; filename="${af.name}"',
-            'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-          });
+        final entryName =
+            Uri.decodeComponent(entryParam);
+
+        final bytes =
+            await file.readAsBytes();
+
+        final archive =
+            ZipDecoder().decodeBytes(bytes);
+
+        final af = archive.files.firstWhere(
+          (f) => f.name == entryName,
+          orElse: () => ArchiveFile(
+            '',
+            0,
+            null,
+          ),
+        );
+
+        if (af.name.isEmpty ||
+            af.content == null) {
+          _logger.log(
+            '❌ Entry not found in archive: '
+            '$entryName',
+          );
+
+          return shelf.Response.notFound(
+            'Entry not found',
+          );
         }
 
-        return shelf.Response.ok(Stream.fromIterable([entryBytes]), headers: {
-          'Content-Type': _getMimeType(path.extension(af.name).toLowerCase()),
-          'Content-Length': entryBytes.length.toString(),
-          'Content-Disposition': 'attachment; filename="${af.name}"',
-          'Accept-Ranges': 'bytes',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache',
-          'Expires': '0',
-        });
+        final entryBytes =
+            af.content as List<int>;
+
+        // Range support for entry bytes.
+        final rangeHeader =
+            request.headers['range'];
+
+        if (rangeHeader != null &&
+            rangeHeader.startsWith('bytes=')) {
+          final parts =
+              rangeHeader.substring(6).split('-');
+
+          int start =
+              int.parse(parts[0]);
+
+          int end = parts.length > 1 &&
+                  parts[1].isNotEmpty
+              ? int.parse(parts[1])
+              : entryBytes.length - 1;
+
+          if (end >= entryBytes.length) {
+            end = entryBytes.length - 1;
+          }
+
+          final chunk =
+              entryBytes.sublist(
+            start,
+            end + 1,
+          );
+
+          return shelf.Response(
+            206,
+            body: Stream.fromIterable([
+              chunk,
+            ]),
+            headers: {
+              'Content-Type': _getMimeType(
+                path.extension(
+                  af.name,
+                ).toLowerCase(),
+              ),
+              'Content-Length':
+                  chunk.length.toString(),
+              'Content-Range':
+                  'bytes $start-$end/${entryBytes.length}',
+              'Content-Disposition':
+                  'attachment; filename="${af.name}"',
+              'Accept-Ranges': 'bytes',
+              'Cache-Control':
+                  'no-cache, no-store, must-revalidate',
+              'Pragma': 'no-cache',
+              'Expires': '0',
+            },
+          );
+        }
+
+        return shelf.Response.ok(
+          Stream.fromIterable([
+            entryBytes,
+          ]),
+          headers: {
+            'Content-Type': _getMimeType(
+              path.extension(
+                af.name,
+              ).toLowerCase(),
+            ),
+            'Content-Length':
+                entryBytes.length.toString(),
+            'Content-Disposition':
+                'attachment; filename="${af.name}"',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control':
+                'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+          },
+        );
       } catch (e) {
-        _logger.log('❌ Error serving zip entry: $e');
-        return shelf.Response.internalServerError(body: 'error');
+        _logger.log(
+          '❌ Error serving zip entry: $e',
+        );
+
+        return shelf.Response.internalServerError(
+          body: 'error',
+        );
       }
     }
-    
-    // Check if range request (for resumable downloads)
-    final rangeHeader = request.headers['range'];
-    if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
-      return _handleRangeRequest(rangeHeader, file, sharedFile);
+
+    // Check if range request
+    // (for resumable downloads).
+    final rangeHeader =
+        request.headers['range'];
+
+    if (rangeHeader != null &&
+        rangeHeader.startsWith('bytes=')) {
+      return _handleRangeRequest(
+        rangeHeader,
+        file,
+        sharedFile,
+      );
     }
-    
-    _logger.log('📤 Serving complete file: ${sharedFile.name}');
-    
-    // Add cache control headers to prevent caching issues with large files
+
+    _logger.log(
+      '📤 Serving complete file: '
+      '${sharedFile.name}',
+    );
+
     return shelf.Response.ok(
       file.openRead(),
       headers: {
         'Content-Type': sharedFile.mimeType,
-        'Content-Length': sharedFile.size.toString(),
-        'Content-Disposition': 'attachment; filename="${sharedFile.name}"',
+        'Content-Length':
+            sharedFile.size.toString(),
+        'Content-Disposition':
+            'attachment; filename="${sharedFile.name}"',
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Cache-Control':
+            'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0',
       },
     );
   }
-  
-  /// Handle range request for resumable downloads
-  Future<shelf.Response> _handleRangeRequest(String rangeHeader, File file, _SharedFile sharedFile) async {
-    final range = rangeHeader.substring(6);
+
+  /// Handle range request for resumable downloads.
+  Future<shelf.Response> _handleRangeRequest(
+    String rangeHeader,
+    File file,
+    _SharedFile sharedFile,
+  ) async {
+    final range =
+        rangeHeader.substring(6);
+
     final parts = range.split('-');
-    
-    int start = int.parse(parts[0]);
-    int end = parts.length > 1 && parts[1].isNotEmpty 
-        ? int.parse(parts[1]) 
+
+    int start =
+        int.parse(parts[0]);
+
+    int end = parts.length > 1 &&
+            parts[1].isNotEmpty
+        ? int.parse(parts[1])
         : sharedFile.size - 1;
-    
-    // Ensure end is not greater than file size
+
+    // Ensure end is not greater than file size.
     if (end >= sharedFile.size) {
       end = sharedFile.size - 1;
     }
-    
-    // Limit chunk size to prevent memory issues with large files
-    const maxChunkSize = 5 * 1024 * 1024; // 5MB max chunk
+
+    // Limit chunk size to prevent memory issues
+    // with large files.
+    const maxChunkSize =
+        5 * 1024 * 1024;
+
     if (end - start > maxChunkSize) {
-      end = start + maxChunkSize - 1;
+      end =
+          start + maxChunkSize - 1;
     }
-    
-    final length = end - start + 1;
-    
-    _logger.log('📤 Serving partial file: ${sharedFile.name}, bytes $start-$end/${sharedFile.size}');
-    
+
+    final length =
+        end - start + 1;
+
+    _logger.log(
+      '📤 Serving partial file: '
+      '${sharedFile.name}, '
+      'bytes $start-$end/${sharedFile.size}',
+    );
+
     return shelf.Response(
       206,
-      body: file.openRead(start, end + 1),
+      body: file.openRead(
+        start,
+        end + 1,
+      ),
       headers: {
-        'Content-Type': sharedFile.mimeType,
-        'Content-Length': length.toString(),
-        'Content-Range': 'bytes $start-$end/${sharedFile.size}',
-        'Content-Disposition': 'attachment; filename="${sharedFile.name}"',
+        'Content-Type':
+            sharedFile.mimeType,
+        'Content-Length':
+            length.toString(),
+        'Content-Range':
+            'bytes $start-$end/${sharedFile.size}',
+        'Content-Disposition':
+            'attachment; filename="${sharedFile.name}"',
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Cache-Control':
+            'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0',
       },
     );
   }
-  
-  /// Handle list files request
-  Future<shelf.Response> _handleListFilesRequest(shelf.Request request) async {
-    _logger.log('📋 File list requested');
-    
-    // Extract the Host header from the request to use client's perspective URL
-    final requestHost = request.headers['host'];
+
+  /// Handle list files request.
+  Future<shelf.Response> _handleListFilesRequest(
+    shelf.Request request,
+  ) async {
+    _logger.log(
+      '📋 File list requested',
+    );
+
+    // Extract the Host header from the request
+    // to use client's perspective URL.
+    final requestHost =
+        request.headers['host'];
+
     String baseUrl;
-    
+
     if (requestHost != null) {
-      // Use the host header from the client's request
-      baseUrl = 'http://$requestHost';
-      _logger.log('🌐 Using client-provided host header: $requestHost');
+      baseUrl =
+          'http://$requestHost';
+
+      _logger.log(
+        '🌐 Using client-provided host header: '
+        '$requestHost',
+      );
     } else {
-      // Fallback to our network IP if host header is not available
-      baseUrl = 'http://$_networkAccessibleIp:$_port';
-      _logger.log('⚠️ No host header, using network IP: $_networkAccessibleIp:$_port');
+      baseUrl =
+          'http://$_networkAccessibleIp:$_port';
+
+      _logger.log(
+        '⚠️ No host header, using network IP: '
+        '$_networkAccessibleIp:$_port',
+      );
     }
-    
-    _logger.log('🌐 Using base URL for response: $baseUrl');
-    
-    final files = _sharedFiles.values.map((file) => {
-      'id': file.id,
-      'name': file.name,
-      'size': file.size,
-      'mimeType': file.mimeType,
-      'dateAdded': file.dateAdded.toIso8601String(),
-      'url': '$baseUrl/files/${file.id}',
-    }).toList();
-    
+
+    _logger.log(
+      '🌐 Using base URL for response: $baseUrl',
+    );
+
+    final files =
+        _sharedFiles.values.map(
+      (file) => {
+        'id': file.id,
+        'name': file.name,
+        'size': file.size,
+        'mimeType': file.mimeType,
+        'dateAdded':
+            file.dateAdded.toIso8601String(),
+        'url':
+            '$baseUrl/files/${file.id}',
+      },
+    ).toList();
+
     return shelf.Response.ok(
       jsonEncode(files),
-      headers: {'Content-Type': 'application/json'},
+      headers: {
+        'Content-Type': 'application/json',
+      },
     );
   }
 
-  // In-memory store for warmup reports keyed by client id
-  final Map<String, Map<String, dynamic>> _warmupReports = {};
-  // In-memory scheduler logs (most recent first)
-  final List<Map<String, dynamic>> _schedulerLogs = [];
-  // In-memory result reports keyed by job id (most recent first)
-  final Map<String, List<Map<String, dynamic>>> _resultReportsByJob = {};
-  // per-job default units to assign when clients request next
-  final Map<String, int> _jobDefaultUnits = {};
+  // ---------------------------------------------------------------------------
+  // WARMUP
+  // ---------------------------------------------------------------------------
 
-  /// Handle warmup reports posted by clients
-  Future<shelf.Response> _handleWarmupReport(shelf.Request request) async {
+  /// Handle warmup reports posted by clients.
+  Future<shelf.Response> _handleWarmupReport(
+    shelf.Request request,
+  ) async {
     try {
-      final body = await request.readAsString();
-      final Map<String, dynamic> j = jsonDecode(body);
-      final clientId = j['client_id'] as String? ?? 'unknown';
+      final body =
+          await request.readAsString();
+
+      final Map<String, dynamic> j =
+          jsonDecode(body);
+
+      final clientId =
+          j['client_id'] as String? ??
+              'unknown';
+
       _warmupReports[clientId] = j;
-      _logger.log('📥 Warmup report received from $clientId: $j');
 
-      // Seed distribution manager with this client's estimate
+      _logger.log(
+        '📥 Warmup report received from '
+        '$clientId: $j',
+      );
+
+      // Seed distribution manager with this client's estimate.
       try {
-        final tt = (j['ttproc_ms'] as num?)?.toDouble() ?? 0.0;
-        final bw = (j['bandwidth_kBps'] as num?)?.toDouble() ?? 0.0;
-        distributionManager.registerClient(clientId, ClientEstimate(ttprocMs: tt, bandwidthKbps: bw));
-        _logger.log('🔧 Registered client $clientId in DistributionManager with tt=$tt ms, bw=$bw kB/s');
+        final tt =
+            (j['ttproc_ms'] as num?)
+                    ?.toDouble() ??
+                0.0;
 
-        // If there are no units for the demo job, register a small demo job so we can show scheduling results
+        final bw =
+            (j['bandwidth_kBps'] as num?)
+                    ?.toDouble() ??
+                0.0;
+
+        distributionManager.registerClient(
+          clientId,
+          ClientEstimate(
+            ttprocMs: tt,
+            bandwidthKbps: bw,
+          ),
+        );
+
+        _logger.log(
+          '🔧 Registered client $clientId '
+          'in DistributionManager with '
+          'tt=$tt ms, bw=$bw kB/s',
+        );
+
+        // If there are no units for the demo job,
+        // register a small demo job so we can show
+        // scheduling results.
         try {
-          final prog = distributionManager.jobProgress('demo_job');
-          final totalUnits = (prog['total'] is int) ? prog['total'] as int : int.tryParse('${prog['total']}') ?? 0;
+          final prog =
+              distributionManager.jobProgress(
+            'demo_job',
+          );
+
+          final totalUnits =
+              (prog['total'] is int)
+                  ? prog['total'] as int
+                  : int.tryParse(
+                        '${prog['total']}',
+                      ) ??
+                      0;
+
           if (totalUnits == 0) {
-            // Prefer a recently shared dataset (zip / coco) to create units from
-            _logger.log('🔍 Looking for a shared dataset to create demo_job units');
+            // Prefer a recently shared dataset
+            // (zip / coco) to create units from.
+            _logger.log(
+              '🔍 Looking for a shared dataset '
+              'to create demo_job units',
+            );
+
             _SharedFile? datasetFile;
+
             try {
-              datasetFile = _sharedFiles.values.toList().reversed.firstWhere((f) => f.mimeType == 'application/zip' || f.name.toLowerCase().contains('coco'), orElse: () => _SharedFile(id: '', file: File(''), name: '', size: 0, mimeType: '', dateAdded: DateTime.now()));
-              if (datasetFile.id == '') datasetFile = null;
+              datasetFile =
+                  _sharedFiles.values
+                      .toList()
+                      .reversed
+                      .firstWhere(
+                (f) =>
+                    f.mimeType ==
+                        'application/zip' ||
+                    f.name
+                        .toLowerCase()
+                        .contains('coco'),
+                orElse: () => _SharedFile(
+                  id: '',
+                  file: File(''),
+                  name: '',
+                  size: 0,
+                  mimeType: '',
+                  dateAdded:
+                      DateTime.now(),
+                ),
+              );
+
+              if (datasetFile.id == '') {
+                datasetFile = null;
+              }
             } catch (_) {
               datasetFile = null;
             }
 
             List<Unit> jobUnits = [];
-            if (datasetFile != null && datasetFile.size > 0) {
-              _logger.log('🧾 Using shared dataset ${datasetFile.name} (${_formatFileSize(datasetFile.size)}) for demo_job');
-              // If the shared dataset is a ZIP, enumerate image entries and create one unit per image.
-              if (datasetFile.mimeType == 'application/zip' || datasetFile.name.toLowerCase().endsWith('.zip')) {
+
+            if (datasetFile != null &&
+                datasetFile.size > 0) {
+              _logger.log(
+                '🧾 Using shared dataset '
+                '${datasetFile.name} '
+                '(${_formatFileSize(datasetFile.size)}) '
+                'for demo_job',
+              );
+
+              // If the shared dataset is a ZIP,
+              // enumerate image entries and create
+              // one unit per image.
+              if (datasetFile.mimeType ==
+                      'application/zip' ||
+                  datasetFile.name
+                      .toLowerCase()
+                      .endsWith('.zip')) {
                 try {
-                  final bytes = await datasetFile.file.readAsBytes();
-                  final archive = ZipDecoder().decodeBytes(bytes);
-                  final imageFiles = archive.files.where((f) => f.isFile && (f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.jpeg') || f.name.toLowerCase().endsWith('.png') || f.name.toLowerCase().endsWith('.bmp') || f.name.toLowerCase().endsWith('.webp'))).toList();
+                  final bytes =
+                      await datasetFile.file
+                          .readAsBytes();
+
+                  final archive =
+                      ZipDecoder().decodeBytes(
+                    bytes,
+                  );
+
+                  final imageFiles =
+                      archive.files.where(
+                    (f) =>
+                        f.isFile &&
+                        (f.name
+                                .toLowerCase()
+                                .endsWith('.jpg') ||
+                            f.name
+                                .toLowerCase()
+                                .endsWith('.jpeg') ||
+                            f.name
+                                .toLowerCase()
+                                .endsWith('.png') ||
+                            f.name
+                                .toLowerCase()
+                                .endsWith('.bmp') ||
+                            f.name
+                                .toLowerCase()
+                                .endsWith('.webp')),
+                  ).toList();
+
                   if (imageFiles.isNotEmpty) {
                     int idx = 0;
-                    for (final af in imageFiles) {
-                      final entryName = af.name;
-                      final entrySize = af.size;
-                      final fileUrl = '$networkServerUrl/files/${datasetFile.id}?entry=${Uri.encodeComponent(entryName)}';
-                      jobUnits.add(Unit(unitIndex: idx++, start: 0, end: entrySize > 0 ? entrySize - 1 : 0, fileUrl: fileUrl));
+
+                    for (final af
+                        in imageFiles) {
+                      final entryName =
+                          af.name;
+
+                      final entrySize =
+                          af.size;
+
+                      final fileUrl =
+                          '$networkServerUrl'
+                          '/files/${datasetFile.id}'
+                          '?entry=${Uri.encodeComponent(entryName)}';
+
+                      jobUnits.add(
+                        Unit(
+                          unitIndex: idx++,
+                          start: 0,
+                          end: entrySize > 0
+                              ? entrySize - 1
+                              : 0,
+                          fileUrl: fileUrl,
+                        ),
+                      );
                     }
                   } else {
-                    _logger.log('⚠️ No image entries found inside ZIP; falling back to chunked units of the full file');
-                    final int parts = 10;
-                    final int chunk = (datasetFile.size / parts).ceil();
-                    for (int i = 0; i < parts; i++) {
-                      final start = i * chunk;
-                      final end = (i == parts - 1) ? datasetFile.size - 1 : ((i + 1) * chunk - 1);
-                      final fileUrl = '$networkServerUrl/files/${datasetFile.id}';
-                      jobUnits.add(Unit(unitIndex: i, start: start, end: end, fileUrl: fileUrl));
+                    _logger.log(
+                      '⚠️ No image entries found '
+                      'inside ZIP; falling back to '
+                      'chunked units of the full file',
+                    );
+
+                    const int parts = 10;
+
+                    final int chunk =
+                        (datasetFile.size /
+                                parts)
+                            .ceil();
+
+                    for (
+                      int i = 0;
+                      i < parts;
+                      i++
+                    ) {
+                      final start =
+                          i * chunk;
+
+                      final end =
+                          (i == parts - 1)
+                              ? datasetFile.size -
+                                  1
+                              : ((i + 1) *
+                                      chunk) -
+                                  1;
+
+                      final fileUrl =
+                          '$networkServerUrl'
+                          '/files/${datasetFile.id}';
+
+                      jobUnits.add(
+                        Unit(
+                          unitIndex: i,
+                          start: start,
+                          end: end,
+                          fileUrl: fileUrl,
+                        ),
+                      );
                     }
                   }
                 } catch (e) {
-                  _logger.log('⚠️ Error reading ZIP to enumerate entries: $e - falling back to chunked units');
-                  final int parts = 10;
-                  final int chunk = (datasetFile.size / parts).ceil();
-                  for (int i = 0; i < parts; i++) {
-                    final start = i * chunk;
-                    final end = (i == parts - 1) ? datasetFile.size - 1 : ((i + 1) * chunk - 1);
-                    final fileUrl = '$networkServerUrl/files/${datasetFile.id}';
-                    jobUnits.add(Unit(unitIndex: i, start: start, end: end, fileUrl: fileUrl));
+                  _logger.log(
+                    '⚠️ Error reading ZIP to '
+                    'enumerate entries: $e - '
+                    'falling back to chunked units',
+                  );
+
+                  const int parts = 10;
+
+                  final int chunk =
+                      (datasetFile.size /
+                              parts)
+                          .ceil();
+
+                  for (
+                    int i = 0;
+                    i < parts;
+                    i++
+                  ) {
+                    final start =
+                        i * chunk;
+
+                    final end =
+                        (i == parts - 1)
+                            ? datasetFile.size -
+                                1
+                            : ((i + 1) *
+                                    chunk) -
+                                1;
+
+                    final fileUrl =
+                        '$networkServerUrl'
+                        '/files/${datasetFile.id}';
+
+                    jobUnits.add(
+                      Unit(
+                        unitIndex: i,
+                        start: start,
+                        end: end,
+                        fileUrl: fileUrl,
+                      ),
+                    );
                   }
                 }
               } else {
-                final fileUrl = '$networkServerUrl/files/${datasetFile.id}';
-                final int parts = 10;
-                final int chunk = (datasetFile.size / parts).ceil();
-                for (int i = 0; i < parts; i++) {
-                  final start = i * chunk;
-                  final end = (i == parts - 1) ? datasetFile.size - 1 : ((i + 1) * chunk - 1);
-                  jobUnits.add(Unit(unitIndex: i, start: start, end: end, fileUrl: fileUrl));
+                final fileUrl =
+                    '$networkServerUrl'
+                    '/files/${datasetFile.id}';
+
+                const int parts = 10;
+
+                final int chunk =
+                    (datasetFile.size /
+                            parts)
+                        .ceil();
+
+                for (
+                  int i = 0;
+                  i < parts;
+                  i++
+                ) {
+                  final start =
+                      i * chunk;
+
+                  final end =
+                      (i == parts - 1)
+                          ? datasetFile.size -
+                              1
+                          : ((i + 1) *
+                                  chunk) -
+                              1;
+
+                  jobUnits.add(
+                    Unit(
+                      unitIndex: i,
+                      start: start,
+                      end: end,
+                      fileUrl: fileUrl,
+                    ),
+                  );
                 }
               }
             } else {
-              // Fallback to a dummy demo file path
-              _logger.log('⚠️ No shared dataset found, falling back to dummy demo file for demo_job');
-              jobUnits = List<Unit>.generate(10, (i) => Unit(unitIndex: i, start: i * 1000, end: (i + 1) * 1000 - 1, fileUrl: '${networkServerUrl}/files/demo'));
+              // Fallback to a dummy demo file path.
+              _logger.log(
+                '⚠️ No shared dataset found, '
+                'falling back to dummy demo file '
+                'for demo_job',
+              );
+
+              jobUnits =
+                  List<Unit>.generate(
+                10,
+                (i) => Unit(
+                  unitIndex: i,
+                  start: i * 1000,
+                  end:
+                      (i + 1) * 1000 - 1,
+                  fileUrl:
+                      '${networkServerUrl}/files/demo',
+                ),
+              );
             }
 
-            final jobId = datasetFile != null && datasetFile.id.isNotEmpty ? datasetFile.id : 'demo_job';
-            distributionManager.registerJob(jobId, jobUnits);
-            _logger.log('🧪 Registered job $jobId with ${jobUnits.length} units for scheduling demo');
+            final jobId =
+                datasetFile != null &&
+                        datasetFile.id.isNotEmpty
+                    ? datasetFile.id
+                    : 'demo_job';
+
+            distributionManager.registerJob(
+              jobId,
+              jobUnits,
+            );
+
+            _logger.log(
+              '🧪 Registered job $jobId with '
+              '${jobUnits.length} units for '
+              'scheduling demo',
+            );
           }
         } catch (e) {
-          _logger.log('⚠️ Error checking/creating demo_job: $e');
+          _logger.log(
+            '⚠️ Error checking/creating demo_job: $e',
+          );
         }
-        // Produce a scheduling suggestion using current client estimates and log the assignments
+
+        // Produce a scheduling suggestion using
+        // current client estimates and log assignments.
         try {
-          // For each registered client, request assignments and log which units would be given
-          final clients = distributionManager.registeredClientIds;
-      final suggestionSummary = {'time': DateTime.now().toIso8601String(), 'type': 'suggestion', 'assignments': {}};
+          final clients =
+              distributionManager
+                  .registeredClientIds;
+
+          final suggestionSummary =
+              <String, dynamic>{
+            'time':
+                DateTime.now()
+                    .toIso8601String(),
+            'type': 'suggestion',
+            'assignments': <String, dynamic>{},
+          };
+
           for (final cid in clients) {
-            final jobIdForSuggestion = _sharedFiles.values.isNotEmpty ? _sharedFiles.values.toList().reversed.first.id : 'demo_job';
-            final assigned = distributionManager.suggestNext(jobIdForSuggestion, cid, maxUnits: 2);
+            final jobIdForSuggestion =
+                _sharedFiles.values.isNotEmpty
+                    ? _sharedFiles.values
+                        .toList()
+                        .reversed
+                        .first
+                        .id
+                    : 'demo_job';
+
+            final assigned =
+                distributionManager
+                    .suggestNext(
+              jobIdForSuggestion,
+              cid,
+              maxUnits: 2,
+            );
+
             if (assigned.isNotEmpty) {
-              _logger.log('📈 Scheduling suggestion for $cid: ${assigned.map((u) => u.unitIndex).toList()}');
-        (suggestionSummary['assignments'] as Map)[cid] = assigned.map((u) => u.unitIndex).toList();
+              _logger.log(
+                '📈 Scheduling suggestion '
+                'for $cid: '
+                '${assigned.map((u) => u.unitIndex).toList()}',
+              );
+
+              (suggestionSummary[
+                      'assignments']
+                  as Map)[cid] = assigned
+                  .map((u) => u.unitIndex)
+                  .toList();
             } else {
-              _logger.log('📈 Scheduling suggestion for $cid: none');
-        (suggestionSummary['assignments'] as Map)[cid] = [];
+              _logger.log(
+                '📈 Scheduling suggestion '
+                'for $cid: none',
+              );
+
+              (suggestionSummary[
+                      'assignments']
+                  as Map)[cid] = [];
             }
           }
-      // store recent suggestion
-      _schedulerLogs.insert(0, suggestionSummary);
-      if (_schedulerLogs.length > 50) _schedulerLogs.removeLast();
+
+          // Store recent suggestion.
+          _schedulerLogs.insert(
+            0,
+            suggestionSummary,
+          );
+
+          if (_schedulerLogs.length > 50) {
+            _schedulerLogs.removeLast();
+          }
         } catch (e) {
-          _logger.log('⚠️ Error generating scheduling suggestions: $e');
+          _logger.log(
+            '⚠️ Error generating scheduling '
+            'suggestions: $e',
+          );
         }
       } catch (e) {
-        _logger.log('⚠️ Error seeding DistributionManager: $e');
+        _logger.log(
+          '⚠️ Error seeding DistributionManager: $e',
+        );
       }
-      return shelf.Response.ok(jsonEncode({'status': 'ok'}), headers: {'Content-Type': 'application/json'});
+
+      return shelf.Response.ok(
+        jsonEncode({
+          'status': 'ok',
+        }),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error processing warmup report: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error processing warmup report: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Return current warmup reports as JSON
-  Future<shelf.Response> _handleWarmupStatus(shelf.Request request) async {
+  /// Return current warmup reports as JSON.
+  Future<shelf.Response> _handleWarmupStatus(
+    shelf.Request request,
+  ) async {
     try {
-      return shelf.Response.ok(jsonEncode(_warmupReports), headers: {'Content-Type': 'application/json'});
+      return shelf.Response.ok(
+        jsonEncode(_warmupReports),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error serializing warmup reports: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error serializing warmup reports: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Return job status: progress and per-client assigned units
-  Future<shelf.Response> _handleJobStatus(shelf.Request request) async {
+  // ---------------------------------------------------------------------------
+  // EXPERIMENT RESET
+  // ---------------------------------------------------------------------------
+
+  /// Reset all experiment-specific state.
+  ///
+  /// This is intentionally separate from server/client configuration.
+  ///
+  /// Preserved:
+  /// - HTTP server
+  /// - shared files
+  /// - connected clients
+  /// - client warmup/performance estimates
+  /// - job configuration
+  /// - selected scheduling algorithm
+  /// - default max-units configuration
+  ///
+  /// Reset:
+  /// - DistributionManager assignment state
+  /// - scheduler logs
+  /// - result reports
+  /// - experiment metrics
+  Future<shelf.Response> _handleResetExperiment(
+    shelf.Request request,
+  ) async {
     try {
-      // collect jobs known to distribution manager
-      final jobs = <String, dynamic>{};
+      _logger.log(
+        '🔄 Resetting current experiment...',
+      );
+
+      // Reset scheduler/unit assignment state.
+      distributionManager.resetExperiment();
+
+      // Clear experiment-specific server state.
+      _schedulerLogs.clear();
+      _resultReportsByJob.clear();
+
+      _logger.log(
+        '✅ Experiment state reset successfully',
+      );
+
+      return shelf.Response.ok(
+        jsonEncode({
+          'status': 'ok',
+          'message':
+              'Experiment reset successfully',
+        }),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
+    } catch (e) {
+      _logger.log(
+        '❌ Error resetting experiment: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: jsonEncode({
+          'status': 'error',
+          'message':
+              'Failed to reset experiment',
+        }),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // JOB STATUS
+  // ---------------------------------------------------------------------------
+
+  /// Return job status: progress and per-client
+  /// assigned units.
+  Future<shelf.Response> _handleJobStatus(
+    shelf.Request request,
+  ) async {
+    try {
+      // Collect jobs known to distribution manager.
+      final jobs =
+          <String, dynamic>{};
+
       try {
-        // Note: DistributionManager keeps jobs internally; access via jobProgress and registeredClientIds
-        // We'll enumerate registered clients and ask for their queues
-        final clients = distributionManager.registeredClientIds;
+        // DistributionManager keeps jobs internally;
+        // access via jobProgress and registeredClientIds.
+        final clients =
+            distributionManager
+                .registeredClientIds;
+
         for (final cid in clients) {
-          final q = distributionManager.getClientQueue(cid);
-          jobs[cid] = q.map((u) => {'unitIndex': u.unitIndex, 'fileUrl': u.fileUrl}).toList();
+          final q =
+              distributionManager
+                  .getClientQueue(cid);
+
+          jobs[cid] = q
+              .map(
+                (u) => {
+                  'unitIndex':
+                      u.unitIndex,
+                  'fileUrl':
+                      u.fileUrl,
+                },
+              )
+              .toList();
         }
       } catch (_) {}
 
-      // include job progress for demo_job fallback plus any other job ids known via _jobs is internal
-      final progress = <String, dynamic>{};
+      // Include job progress for demo_job fallback
+      // plus any other job ids known via shared files.
+      final progress =
+          <String, dynamic>{};
+
       try {
-        // attempt to check a few job ids: demo_job and any shared file ids
-        final candidateIds = <String>{'demo_job'};
-        candidateIds.addAll(_sharedFiles.keys);
+        final candidateIds =
+            <String>{'demo_job'};
+
+        candidateIds.addAll(
+          _sharedFiles.keys,
+        );
+
         for (final jid in candidateIds) {
-          final p = distributionManager.jobProgress(jid);
-          if (p['total'] != 0) progress[jid] = p;
+          final p =
+              distributionManager.jobProgress(
+            jid,
+          );
+
+          if (p['total'] != 0) {
+            progress[jid] = p;
+          }
         }
       } catch (_) {}
 
-      final Map<String, dynamic> out = {'per_client_queues': jobs, 'progress': progress};
+      final Map<String, dynamic> out = {
+        'per_client_queues': jobs,
+        'progress': progress,
+      };
+
       final Map<String, dynamic> recent = {};
+
       try {
-        for (final e in _resultReportsByJob.entries) {
+        for (final e
+            in _resultReportsByJob.entries) {
           recent[e.key] = e.value;
         }
       } catch (_) {}
+
       out['recent_results'] = recent;
-      return shelf.Response.ok(jsonEncode(out), headers: {'Content-Type': 'application/json'});
+
+      return shelf.Response.ok(
+        jsonEncode(out),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error generating job status: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error generating job status: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  Future<shelf.Response> _handleSchedulerLogs(shelf.Request request) async {
+  // ---------------------------------------------------------------------------
+  // SCHEDULER LOGS
+  // ---------------------------------------------------------------------------
+
+  Future<shelf.Response> _handleSchedulerLogs(
+    shelf.Request request,
+  ) async {
     try {
-      return shelf.Response.ok(jsonEncode(_schedulerLogs), headers: {'Content-Type': 'application/json'});
+      return shelf.Response.ok(
+        jsonEncode(_schedulerLogs),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error serializing scheduler logs: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error serializing scheduler logs: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Return per-client assignment for a job (non-destructive)
-  Future<shelf.Response> _handleGetAssignmentForClient(shelf.Request request, String jobId, String clientId) async {
-    try {
-      final queue = distributionManager.getClientQueue(clientId);
-      final assignment = PerClientAssignment(jobId: jobId, clientId: clientId, units: queue);
-      return shelf.Response.ok(jsonEncode(assignment.toJson()), headers: {'Content-Type': 'application/json'});
-    } catch (e) {
-      _logger.log('❌ Error fetching assignment for $clientId on $jobId: $e');
-      return shelf.Response.internalServerError(body: 'error');
-    }
-  }
+  // ---------------------------------------------------------------------------
+  // METRICS DOWNLOAD
+  // ---------------------------------------------------------------------------
 
-  /// Request next assignment for a client (will assign using scheduler)
-  Future<shelf.Response> _handleGetNextAssignment(shelf.Request request, String jobId) async {
+  /// Generate a plain-text metrics report for the current experiment.
+  ///
+  /// The report contains only information accumulated since the most recent
+  /// experiment reset/start:
+  /// - experiment timestamp
+  /// - scheduling activity
+  /// - job progress
+  /// - per-result client metrics
+  /// - aggregate client metrics
+  ///
+  /// Warmup information and persistent configuration are intentionally excluded.
+  Future<shelf.Response> _handleDownloadMetrics(
+    shelf.Request request,
+  ) async {
     try {
-      final clientId = request.url.queryParameters['for'] ?? 'unknown';
-      if (clientId == 'unknown') return shelf.Response(400, body: 'missing client id');
-      // determine maxUnits: prefer explicit query param, then job default, then 2
-      int maxUnits = 2;
-      try {
-        final q = request.url.queryParameters['max'];
-        if (q != null) maxUnits = int.tryParse(q) ?? maxUnits;
-        else if (_jobDefaultUnits.containsKey(jobId)) maxUnits = _jobDefaultUnits[jobId]!;
-      } catch (_) {}
-      final units = distributionManager.assignNext(jobId, clientId, maxUnits: maxUnits);
-      final assignment = PerClientAssignment(jobId: jobId, clientId: clientId, units: units);
-      _logger.log('📦 Assigned ${units.length} units to $clientId for job $jobId');
-      if (units.isEmpty) {
-        // If job does not exist, log clearly
-        if (!distributionManager.hasJob(jobId)) {
-          _logger.log('⚠️ Request for next assignment: job $jobId not found');
-          return shelf.Response.notFound('job_not_found');
+      _logger.log(
+        '📊 Metrics download requested',
+      );
+
+      final buffer =
+          StringBuffer();
+
+      final generatedAt =
+          DateTime.now();
+
+      buffer.writeln(
+        'DISTRIBUTED INFERENCE EXPERIMENT METRICS',
+      );
+      buffer.writeln(
+        '========================================',
+      );
+      buffer.writeln(
+        'Generated: ${generatedAt.toIso8601String()}',
+      );
+      buffer.writeln();
+
+      // -----------------------------------------------------------------------
+      // SCHEDULING SUMMARY
+      // -----------------------------------------------------------------------
+
+      buffer.writeln(
+        'SCHEDULING ACTIVITY',
+      );
+      buffer.writeln(
+        '-------------------',
+      );
+
+      if (_schedulerLogs.isEmpty) {
+        buffer.writeln(
+          'No scheduling activity recorded.',
+        );
+      } else {
+        buffer.writeln(
+          'Total log entries: ${_schedulerLogs.length}',
+        );
+
+        buffer.writeln();
+
+        for (int i = 0;
+            i < _schedulerLogs.length;
+            i++) {
+          final entry =
+              _schedulerLogs[i];
+
+          buffer.writeln(
+            'Entry ${i + 1}:',
+          );
+
+          entry.forEach(
+            (key, value) {
+              buffer.writeln(
+                '  $key: $value',
+              );
+            },
+          );
+
+          buffer.writeln();
         }
-        // No units available right now — return progress metadata so clients can see state
+      }
+
+      // -----------------------------------------------------------------------
+      // RESULT SUMMARY
+      // -----------------------------------------------------------------------
+
+      buffer.writeln(
+        'RESULT SUMMARY',
+      );
+      buffer.writeln(
+        '--------------',
+      );
+
+      int totalResults = 0;
+      double totalProcessingTime = 0.0;
+      double totalBandwidth = 0.0;
+
+      final Map<String, int>
+          resultsPerClient = {};
+
+      final Map<String, List<double>>
+          processingTimesByClient = {};
+
+      final Map<String, List<double>>
+          bandwidthByClient = {};
+
+      for (final jobEntry
+          in _resultReportsByJob.entries) {
+        final jobId = jobEntry.key;
+        final results = jobEntry.value;
+
+        buffer.writeln(
+          'Job: $jobId',
+        );
+        buffer.writeln(
+          '  Results: ${results.length}',
+        );
+
+        for (final result
+            in results) {
+          totalResults++;
+
+          final clientId =
+              '${result['clientId'] ?? result['client_id'] ?? 'unknown'}';
+
+          final ttprocValue =
+              result['ttprocMs'] ??
+                  result['ttproc_ms'];
+
+          final bandwidthValue =
+              result['bandwidthKbps'] ??
+                  result['bandwidth_kbps'];
+
+          final ttproc =
+              ttprocValue is num
+                  ? ttprocValue
+                      .toDouble()
+                  : double.tryParse(
+                        '$ttprocValue',
+                      ) ??
+                      0.0;
+
+          final bandwidth =
+              bandwidthValue is num
+                  ? bandwidthValue
+                      .toDouble()
+                  : double.tryParse(
+                        '$bandwidthValue',
+                      ) ??
+                      0.0;
+
+          totalProcessingTime +=
+              ttproc;
+
+          totalBandwidth +=
+              bandwidth;
+
+          resultsPerClient[
+                  clientId] =
+              (resultsPerClient[
+                          clientId] ??
+                      0) +
+                  1;
+
+          processingTimesByClient
+              .putIfAbsent(
+            clientId,
+            () => [],
+          )
+              .add(ttproc);
+
+          bandwidthByClient
+              .putIfAbsent(
+            clientId,
+            () => [],
+          )
+              .add(bandwidth);
+
+          buffer.writeln(
+            '  Unit: '
+            '${result['unitIndex'] ?? result['unit_index'] ?? 'unknown'}',
+          );
+
+          buffer.writeln(
+            '    Client: $clientId',
+          );
+
+          buffer.writeln(
+            '    Processing time (ms): '
+            '${ttproc.toStringAsFixed(3)}',
+          );
+
+          buffer.writeln(
+            '    Bandwidth (kB/s): '
+            '${bandwidth.toStringAsFixed(3)}',
+          );
+
+          if (result['received_at'] != null) {
+            buffer.writeln(
+              '    Received at: '
+              '${result['received_at']}',
+            );
+          }
+        }
+
+        buffer.writeln();
+      }
+
+      buffer.writeln(
+        'Total results: $totalResults',
+      );
+
+      if (totalResults > 0) {
+        buffer.writeln(
+          'Average processing time (ms): '
+          '${(totalProcessingTime / totalResults).toStringAsFixed(3)}',
+        );
+
+        buffer.writeln(
+          'Average bandwidth (kB/s): '
+          '${(totalBandwidth / totalResults).toStringAsFixed(3)}',
+        );
+      } else {
+        buffer.writeln(
+          'Average processing time (ms): 0.000',
+        );
+
+        buffer.writeln(
+          'Average bandwidth (kB/s): 0.000',
+        );
+      }
+
+      buffer.writeln();
+
+      // -----------------------------------------------------------------------
+      // PER-CLIENT SUMMARY
+      // -----------------------------------------------------------------------
+
+      buffer.writeln(
+        'PER-CLIENT SUMMARY',
+      );
+      buffer.writeln(
+        '------------------',
+      );
+
+      if (resultsPerClient.isEmpty) {
+        buffer.writeln(
+          'No client result data recorded.',
+        );
+      } else {
+        for (final clientId
+            in resultsPerClient.keys) {
+          final resultCount =
+              resultsPerClient[
+                  clientId]!;
+
+          final processingValues =
+              processingTimesByClient[
+                      clientId] ??
+                  [];
+
+          final bandwidthValues =
+              bandwidthByClient[
+                      clientId] ??
+                  [];
+
+          final avgProcessing =
+              processingValues.isEmpty
+                  ? 0.0
+                  : processingValues
+                          .reduce(
+                            (a, b) => a + b,
+                          ) /
+                      processingValues.length;
+
+          final avgBandwidth =
+              bandwidthValues.isEmpty
+                  ? 0.0
+                  : bandwidthValues
+                          .reduce(
+                            (a, b) => a + b,
+                          ) /
+                      bandwidthValues.length;
+
+          buffer.writeln(
+            'Client: $clientId',
+          );
+
+          buffer.writeln(
+            '  Results completed: '
+            '$resultCount',
+          );
+
+          buffer.writeln(
+            '  Average processing time (ms): '
+            '${avgProcessing.toStringAsFixed(3)}',
+          );
+
+          buffer.writeln(
+            '  Average bandwidth (kB/s): '
+            '${avgBandwidth.toStringAsFixed(3)}',
+          );
+
+          buffer.writeln();
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // JOB PROGRESS
+      // -----------------------------------------------------------------------
+
+      buffer.writeln(
+        'JOB PROGRESS',
+      );
+      buffer.writeln(
+        '------------',
+      );
+
+      final candidateJobIds =
+          <String>{'demo_job'};
+
+      candidateJobIds.addAll(
+        _sharedFiles.keys,
+      );
+
+      bool foundJob = false;
+
+      for (final jobId
+          in candidateJobIds) {
+        final progress =
+            distributionManager
+                .jobProgress(jobId);
+
+        if (progress['total'] != 0) {
+          foundJob = true;
+
+          buffer.writeln(
+            'Job: $jobId',
+          );
+
+          buffer.writeln(
+            '  Total: '
+            '${progress['total']}',
+          );
+
+          buffer.writeln(
+            '  Completed: '
+            '${progress['completed']}',
+          );
+
+          buffer.writeln(
+            '  Assigned: '
+            '${progress['assigned']}',
+          );
+
+          buffer.writeln(
+            '  Available: '
+            '${progress['available']}',
+          );
+
+          buffer.writeln();
+        }
+      }
+
+      if (!foundJob) {
+        buffer.writeln(
+          'No job progress data available.',
+        );
+      }
+
+      final metricsText =
+          buffer.toString();
+
+      return shelf.Response.ok(
+        metricsText,
+        headers: {
+          'Content-Type':
+              'text/plain; charset=utf-8',
+          'Content-Disposition':
+              'attachment; filename="experiment_metrics.txt"',
+          'Cache-Control':
+              'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      );
+    } catch (e) {
+      _logger.log(
+        '❌ Error generating experiment metrics: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // ASSIGNMENTS
+  // ---------------------------------------------------------------------------
+
+  /// Return per-client assignment for a job
+  /// (non-destructive).
+  Future<shelf.Response>
+      _handleGetAssignmentForClient(
+    shelf.Request request,
+    String jobId,
+    String clientId,
+  ) async {
+    try {
+      final queue =
+          distributionManager
+              .getClientQueue(clientId);
+
+      final assignment =
+          PerClientAssignment(
+        jobId: jobId,
+        clientId: clientId,
+        units: queue,
+      );
+
+      return shelf.Response.ok(
+        jsonEncode(
+          assignment.toJson(),
+        ),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
+    } catch (e) {
+      _logger.log(
+        '❌ Error fetching assignment for '
+        '$clientId on $jobId: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
+    }
+  }
+
+  /// Request next assignment for a client.
+  Future<shelf.Response>
+      _handleGetNextAssignment(
+    shelf.Request request,
+    String jobId,
+  ) async {
+    try {
+      final clientId =
+          request.url.queryParameters['for'] ??
+              'unknown';
+
+      if (clientId == 'unknown') {
+        return shelf.Response(
+          400,
+          body: 'missing client id',
+        );
+      }
+
+      // Determine maxUnits:
+      // explicit query parameter,
+      // then job default,
+      // then 2.
+      int maxUnits = 2;
+
+      try {
+        final q =
+            request.url.queryParameters['max'];
+
+        if (q != null) {
+          maxUnits =
+              int.tryParse(q) ??
+                  maxUnits;
+        } else if (_jobDefaultUnits
+            .containsKey(jobId)) {
+          maxUnits =
+              _jobDefaultUnits[jobId]!;
+        }
+      } catch (_) {}
+
+      final units =
+          distributionManager.assignNext(
+        jobId,
+        clientId,
+        maxUnits: maxUnits,
+      );
+
+      final assignment =
+          PerClientAssignment(
+        jobId: jobId,
+        clientId: clientId,
+        units: units,
+      );
+
+      _logger.log(
+        '📦 Assigned ${units.length} units '
+        'to $clientId for job $jobId',
+      );
+
+      if (units.isEmpty) {
+        // If job does not exist, log clearly.
+        if (!distributionManager
+            .hasJob(jobId)) {
+          _logger.log(
+            '⚠️ Request for next assignment: '
+            'job $jobId not found',
+          );
+
+          return shelf.Response.notFound(
+            'job_not_found',
+          );
+        }
+
+        // No units available right now.
         try {
-          final prog = distributionManager.jobProgress(jobId);
-          final body = jsonEncode({'job_id': jobId, 'client_id': clientId, 'units': [], 'progress': prog});
-          return shelf.Response.ok(body, headers: {'Content-Type': 'application/json'});
+          final prog =
+              distributionManager
+                  .jobProgress(jobId);
+
+          final body = jsonEncode({
+            'job_id': jobId,
+            'client_id': clientId,
+            'units': [],
+            'progress': prog,
+          });
+
+          return shelf.Response.ok(
+            body,
+            headers: {
+              'Content-Type':
+                  'application/json',
+            },
+          );
         } catch (_) {}
       }
-      // record assignment in scheduler logs
+
+      // Record assignment in scheduler logs.
       try {
-        _schedulerLogs.insert(0, {'time': DateTime.now().toIso8601String(), 'type': 'assignment', 'job': jobId, 'client': clientId, 'units': units.map((u) => u.unitIndex).toList()});
-        if (_schedulerLogs.length > 50) _schedulerLogs.removeLast();
+        _schedulerLogs.insert(
+          0,
+          {
+            'time':
+                DateTime.now()
+                    .toIso8601String(),
+            'type': 'assignment',
+            'job': jobId,
+            'client': clientId,
+            'units': units
+                .map(
+                  (u) => u.unitIndex,
+                )
+                .toList(),
+          },
+        );
+
+        if (_schedulerLogs.length > 50) {
+          _schedulerLogs.removeLast();
+        }
       } catch (_) {}
-      return shelf.Response.ok(jsonEncode(assignment.toJson()), headers: {'Content-Type': 'application/json'});
+
+      return shelf.Response.ok(
+        jsonEncode(
+          assignment.toJson(),
+        ),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error assigning next units for $jobId: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error assigning next units for '
+        '$jobId: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Admin: set job options such as default max units per assignment
-  Future<shelf.Response> _handleSetJobOptions(shelf.Request request) async {
+  // ---------------------------------------------------------------------------
+  // JOB OPTIONS
+  // ---------------------------------------------------------------------------
+
+  /// Admin: set job options such as default
+  /// max units per assignment.
+  Future<shelf.Response>
+      _handleSetJobOptions(
+    shelf.Request request,
+  ) async {
     try {
-      final body = await request.readAsString();
-      final j = jsonDecode(body) as Map<String, dynamic>;
-      final jobId = j['job_id'] as String?;
-      if (jobId == null) return shelf.Response(400, body: 'missing job_id');
-      final defaultMax = (j['default_max_units'] is int) ? j['default_max_units'] as int : int.tryParse('${j['default_max_units']}') ?? 0;
-      if (defaultMax > 0) {
-        _jobDefaultUnits[jobId] = defaultMax;
-        _logger.log('⚙️ Set default_max_units for $jobId -> $defaultMax');
-        return shelf.Response.ok(jsonEncode({'status': 'ok'}), headers: {'Content-Type': 'application/json'});
+      final body =
+          await request.readAsString();
+
+      final j =
+          jsonDecode(body)
+              as Map<String, dynamic>;
+
+      final jobId =
+          j['job_id'] as String?;
+
+      if (jobId == null) {
+        return shelf.Response(
+          400,
+          body: 'missing job_id',
+        );
       }
-      return shelf.Response(400, body: 'invalid default_max_units');
+
+      final defaultMax =
+          (j['default_max_units'] is int)
+              ? j['default_max_units']
+                  as int
+              : int.tryParse(
+                    '${j['default_max_units']}',
+                  ) ??
+                  0;
+
+      if (defaultMax > 0) {
+        _jobDefaultUnits[jobId] =
+            defaultMax;
+
+        _logger.log(
+          '⚙️ Set default_max_units for '
+          '$jobId -> $defaultMax',
+        );
+
+        return shelf.Response.ok(
+          jsonEncode({
+            'status': 'ok',
+          }),
+          headers: {
+            'Content-Type':
+                'application/json',
+          },
+        );
+      }
+
+      return shelf.Response(
+        400,
+        body: 'invalid default_max_units',
+      );
     } catch (e) {
-      _logger.log('❌ Error setting job options: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error setting job options: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Receive result reports from clients for job units
-  Future<shelf.Response> _handlePostResultReport(shelf.Request request, String jobId) async {
-    try {
-      final body = await request.readAsString();
-      final j = jsonDecode(body) as Map<String, dynamic>;
-      final rr = ResultReport.fromJson(j);
-  // Mark unit complete and update client estimate
-      distributionManager.markUnitComplete(jobId, rr.unitIndex);
-      distributionManager.updateClientEstimate(rr.clientId, rr.ttprocMs.toDouble(), rr.bandwidthKbps);
-      _logger.log('✅ Result received for job ${rr.jobId} unit ${rr.unitIndex} from ${rr.clientId} (tt=${rr.ttprocMs}ms bw=${rr.bandwidthKbps}kB/s)');
+  // ---------------------------------------------------------------------------
+  // RESULT REPORTS
+  // ---------------------------------------------------------------------------
 
-      // Produce a quick scheduler summary after receiving result
-      try {
-        final summary = distributionManager.jobProgress(jobId);
-        _logger.log('📊 Job $jobId progress: total=${summary['total']} completed=${summary['completed']} available=${summary['available']}');
-  // append to scheduler logs
-  _schedulerLogs.insert(0, {'time': DateTime.now().toIso8601String(), 'type': 'progress', 'job': jobId, 'progress': summary});
-  if (_schedulerLogs.length > 50) _schedulerLogs.removeLast();
-  
-  // store recent result for UI inspection
+  /// Receive result reports from clients for job units.
+  Future<shelf.Response>
+      _handlePostResultReport(
+    shelf.Request request,
+    String jobId,
+  ) async {
     try {
-      final list = _resultReportsByJob.putIfAbsent(jobId, () => <Map<String, dynamic>>[]);
-      // attempt to lookup the unit's fileUrl from internal job list for convenience
-      String? fileUrl;
+      final body =
+          await request.readAsString();
+
+      final j =
+          jsonDecode(body)
+              as Map<String, dynamic>;
+
+      final rr =
+          ResultReport.fromJson(j);
+
+      // Mark unit complete and update client estimate.
+      distributionManager.markUnitComplete(
+        jobId,
+        rr.unitIndex,
+      );
+
+      distributionManager.updateClientEstimate(
+        rr.clientId,
+        rr.ttprocMs.toDouble(),
+        rr.bandwidthKbps,
+      );
+
+      _logger.log(
+        '✅ Result received for job '
+        '${rr.jobId} unit ${rr.unitIndex} '
+        'from ${rr.clientId} '
+        '(tt=${rr.ttprocMs}ms '
+        'bw=${rr.bandwidthKbps}kB/s)',
+      );
+
+      // Produce a quick scheduler summary
+      // after receiving result.
       try {
-        fileUrl = distributionManager.getUnitFileUrl(jobId, rr.unitIndex);
-      } catch (_) {}
-      // store with a received timestamp for UI display and include original file URL so host can fetch image
-      final entry = <String, dynamic>{'received_at': DateTime.now().toIso8601String(), 'file_url': fileUrl, ...rr.toJson()};
-      list.insert(0, entry);
-      if (list.length > 200) list.removeLast();
-    } catch (_) {}
+        final summary =
+            distributionManager
+                .jobProgress(jobId);
+
+        _logger.log(
+          '📊 Job $jobId progress: '
+          'total=${summary['total']} '
+          'completed=${summary['completed']} '
+          'available=${summary['available']}',
+        );
+
+        // Append to scheduler logs.
+        _schedulerLogs.insert(
+          0,
+          {
+            'time':
+                DateTime.now()
+                    .toIso8601String(),
+            'type': 'progress',
+            'job': jobId,
+            'progress': summary,
+          },
+        );
+
+        if (_schedulerLogs.length > 50) {
+          _schedulerLogs.removeLast();
+        }
+
+        // Store recent result for UI inspection.
+        try {
+          final list =
+              _resultReportsByJob.putIfAbsent(
+            jobId,
+            () =>
+                <Map<String, dynamic>>[],
+          );
+
+          // Attempt to lookup the unit's fileUrl
+          // from internal job list for convenience.
+          String? fileUrl;
+
+          try {
+            fileUrl =
+                distributionManager
+                    .getUnitFileUrl(
+              jobId,
+              rr.unitIndex,
+            );
+          } catch (_) {}
+
+          // Store with a received timestamp
+          // for UI display and include original
+          // file URL so host can fetch image.
+          final entry =
+              <String, dynamic>{
+            'received_at':
+                DateTime.now()
+                    .toIso8601String(),
+            'file_url': fileUrl,
+            ...rr.toJson(),
+          };
+
+          list.insert(
+            0,
+            entry,
+          );
+
+          if (list.length > 200) {
+            list.removeLast();
+          }
+        } catch (_) {}
       } catch (_) {}
 
-      return shelf.Response.ok(jsonEncode({'status': 'ok'}), headers: {'Content-Type': 'application/json'});
+      return shelf.Response.ok(
+        jsonEncode({
+          'status': 'ok',
+        }),
+        headers: {
+          'Content-Type':
+              'application/json',
+        },
+      );
     } catch (e) {
-      _logger.log('❌ Error processing result report: $e');
-      return shelf.Response.internalServerError(body: 'error');
+      _logger.log(
+        '❌ Error processing result report: $e',
+      );
+
+      return shelf.Response.internalServerError(
+        body: 'error',
+      );
     }
   }
 
-  /// Expose warmup reports for UI polling
-  Map<String, Map<String, dynamic>> get warmupReports => Map.from(_warmupReports);
-  
-  /// Get MIME type based on file extension
-  String _getMimeType(String extension) {
+  // ---------------------------------------------------------------------------
+  // PUBLIC GETTERS
+  // ---------------------------------------------------------------------------
+
+  /// Expose warmup reports for UI polling.
+  Map<String, Map<String, dynamic>>
+      get warmupReports =>
+          Map.from(_warmupReports);
+
+  // ---------------------------------------------------------------------------
+  // UTILITY METHODS
+  // ---------------------------------------------------------------------------
+
+  /// Get MIME type based on file extension.
+  String _getMimeType(
+    String extension,
+  ) {
     switch (extension) {
       case '.jpg':
       case '.jpeg':
         return 'image/jpeg';
+
       case '.png':
         return 'image/png';
+
       case '.gif':
         return 'image/gif';
+
       case '.pdf':
         return 'application/pdf';
+
       case '.doc':
       case '.docx':
         return 'application/msword';
+
       case '.xls':
       case '.xlsx':
         return 'application/vnd.ms-excel';
+
       case '.ppt':
       case '.pptx':
         return 'application/vnd.ms-powerpoint';
+
       case '.mp3':
         return 'audio/mpeg';
+
       case '.mp4':
         return 'video/mp4';
+
       case '.zip':
         return 'application/zip';
+
       case '.txt':
         return 'text/plain';
+
       default:
         return 'application/octet-stream';
     }
   }
-  
-  /// Format file size for display
-  String _formatFileSize(int bytes) {
+
+  /// Format file size for display.
+  String _formatFileSize(
+    int bytes,
+  ) {
     if (bytes < 1024) {
       return '$bytes B';
-    } else if (bytes < 1024 * 1024) {
+    } else if (bytes <
+        1024 * 1024) {
       return '${(bytes / 1024).toStringAsFixed(2)} KB';
-    } else if (bytes < 1024 * 1024 * 1024) {
+    } else if (bytes <
+        1024 * 1024 * 1024) {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
     } else {
       return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
     }
   }
-  
-  /// Clean up resources
+
+  // ---------------------------------------------------------------------------
+  // CLEANUP
+  // ---------------------------------------------------------------------------
+
+  /// Clean up resources.
   void dispose() {
     stopServer();
   }
 }
 
-/// Information about a shared file
+// -----------------------------------------------------------------------------
+// SHARED FILE MODEL
+// -----------------------------------------------------------------------------
+
+/// Information about a shared file.
 class _SharedFile {
   final String id;
   final File file;
@@ -741,7 +2285,7 @@ class _SharedFile {
   final int size;
   final String mimeType;
   final DateTime dateAdded;
-  
+
   _SharedFile({
     required this.id,
     required this.file,
@@ -752,14 +2296,18 @@ class _SharedFile {
   });
 }
 
-/// File share information for sending via MQTT
+// -----------------------------------------------------------------------------
+// FILE SHARE INFORMATION
+// -----------------------------------------------------------------------------
+
+/// File share information for sending via MQTT.
 class FileShareInfo {
   final String fileId;
   final String fileName;
   final int fileSize;
   final String mimeType;
   final String url;
-  
+
   FileShareInfo({
     required this.fileId,
     required this.fileName,
@@ -767,7 +2315,7 @@ class FileShareInfo {
     required this.mimeType,
     required this.url,
   });
-  
+
   Map<String, dynamic> toJson() {
     return {
       'type': 'file_share',
@@ -778,8 +2326,10 @@ class FileShareInfo {
       'url': url,
     };
   }
-  
-  factory FileShareInfo.fromJson(Map<String, dynamic> json) {
+
+  factory FileShareInfo.fromJson(
+    Map<String, dynamic> json,
+  ) {
     return FileShareInfo(
       fileId: json['fileId'],
       fileName: json['fileName'],
