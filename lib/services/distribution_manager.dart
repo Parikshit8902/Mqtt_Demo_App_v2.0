@@ -1,10 +1,44 @@
 import 'models/assignment.dart';
 import 'models/result_dto.dart';
 import 'schedulers/scheduler.dart';
-import 'schedulers/greedy_scheduler.dart';
+import 'schedulers/scheduler_type.dart';
+import 'schedulers/scheduler_factory.dart';
 
 class DistributionManager {
-  final Scheduler _scheduler = GreedyScheduler();
+  Scheduler _scheduler;
+
+  SchedulerType _schedulerType =
+      SchedulerType.greedy;
+
+  DistributionManager()
+      : _scheduler =
+            SchedulerFactory.create(
+          SchedulerType.greedy,
+        );
+
+  /// Currently selected scheduling algorithm.
+  SchedulerType get schedulerType =>
+      _schedulerType;
+
+  /// Human-readable scheduler name.
+  String get schedulerName =>
+      _schedulerType.displayName;
+
+  /// Change the scheduling algorithm.
+  ///
+  /// This affects new assignments only.
+  /// Units that have already been assigned are
+  /// not moved between clients.
+  void setSchedulerType(
+    SchedulerType type,
+  ) {
+    if (_schedulerType == type) {
+      return;
+    }
+
+    _schedulerType = type;
+    _scheduler = SchedulerFactory.create(type);
+  }
 
   // jobId -> units
   final Map<String, List<Unit>> _jobs = {};
