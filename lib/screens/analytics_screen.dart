@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 // Import your service file
 import '../services/performance_service.dart';
 import '../services/mqtt_service.dart';
+import 'metrics_report_screen.dart';
 
 // ===========================================================================
 // Main Page Widget (No Changes)
@@ -40,6 +41,13 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
               style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w600, fontSize: 18),
             ),
             const Spacer(),
+            IconButton(
+              tooltip: 'Metrics report & export',
+              icon: const Icon(Icons.query_stats),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => MetricsReportScreen(mqttService: widget.mqttService)),
+              ),
+            ),
             _CoolToggle(
               selectedIndex: _selectedMode[0] ? 0 : 1,
               onChanged: (index) {

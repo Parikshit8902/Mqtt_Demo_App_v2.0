@@ -1,10 +1,37 @@
 import 'models/assignment.dart';
 import 'models/result_dto.dart';
 import 'schedulers/scheduler.dart';
-import 'schedulers/greedy_scheduler.dart';
+import 'schedulers/scheduler_registry.dart';
 
 class DistributionManager {
-  final Scheduler _scheduler = GreedyScheduler();
+  Scheduler _scheduler = SchedulerRegistry.create(SchedulerRegistry.defaultId);
+
+  /// Id of the active scheduling algorithm (see [SchedulerRegistry]).
+  String get schedulerId => _scheduler.id;
+
+  /// Swap the scheduling algorithm. Takes effect on the next assignment request;
+  /// units already assigned stay with their clients.
+  void setScheduler(String id) {
+    if (!SchedulerRegistry.contains(id)) throw ArgumentError('Unknown scheduler: $id');
+    _scheduler = SchedulerRegistry.create(id);
+    scheduleCalls = 0;
+    scheduleTotalUs = 0;
+  }
+
+  /// Cost of the scheduling decision itself, which matters on a phone host
+  /// (a PSO run is far heavier than greedy).
+  int scheduleCalls = 0;
+  int scheduleTotalUs = 0;
+  double get avgScheduleMs => scheduleCalls == 0 ? 0 : scheduleTotalUs / scheduleCalls / 1000.0;
+
+  Map<String, List<Unit>> _runScheduler(List<Unit> available, int maxUnits) {
+    final sw = Stopwatch()..start();
+    final result = _scheduler.schedule(available, _clientEstimates, maxUnits);
+    sw.stop();
+    scheduleCalls++;
+    scheduleTotalUs += sw.elapsedMicroseconds;
+    return result;
+  }
 
   // jobId -> units
   final Map<String, List<Unit>> _jobs = {};
@@ -62,7 +89,7 @@ class DistributionManager {
     final available = units.where((u) => _unitStatus[jobId]![u.unitIndex] == 'available').toList();
     if (available.isEmpty) return [];
 
-    final assignments = _scheduler.schedule(available, _clientEstimates, maxUnits);
+    final assignments = _runScheduler(available, maxUnits);
     final assignedForClient = assignments[clientId] ?? [];
 
     for (final u in assignedForClient) {
@@ -82,7 +109,7 @@ class DistributionManager {
     final available = units.where((u) => _unitStatus[jobId]![u.unitIndex] == 'available').toList();
     if (available.isEmpty) return [];
 
-    final assignments = _scheduler.schedule(available, _clientEstimates, maxUnits);
+    final assignments = _runScheduler(available, maxUnits);
     final assignedForClient = assignments[clientId] ?? [];
     // Do not change _unitStatus or client queues - this is non-destructive
     return assignedForClient;

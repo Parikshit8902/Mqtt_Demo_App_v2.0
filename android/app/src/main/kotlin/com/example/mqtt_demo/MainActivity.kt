@@ -473,6 +473,26 @@ class MainActivity: FlutterActivity() {
                 }
 
                 // --- REAL-TIME DATA METHODS ---
+                // Battery current x voltage gives whole-device power draw. Only meaningful
+                // while unplugged; the sign and unit of CURRENT_NOW vary by vendor, so the
+                // raw value is returned and interpreted on the Dart side.
+                "getPowerDetails" -> {
+                    try {
+                        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                        val status: Intent? = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                        val plugged = status?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+                        val info = mutableMapOf<String, Any>(
+                            "currentNow" to bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW),
+                            "chargeCounterUah" to bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER),
+                            "voltageMv" to (status?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0),
+                            "charging" to (plugged != 0)
+                        )
+                        result.success(info)
+                    } catch (e: Exception) {
+                        result.error("POWER_ERROR", "Failed to read power details", e.localizedMessage)
+                    }
+                }
+
                 "getBatteryDetails" -> {
                     val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                     val batteryStatus: Intent? = context.registerReceiver(null, iFilter)

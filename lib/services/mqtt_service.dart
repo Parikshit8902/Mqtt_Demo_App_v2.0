@@ -17,6 +17,9 @@ import 'topic_manager.dart';
 import 'network_helper.dart';
 import 'client_metrics_publisher.dart';
 import 'performance_service.dart';
+import 'device_info_helper.dart';
+import 'metrics/metrics_store.dart';
+import 'metrics/traffic_counter.dart';
 
 /// Main MQTT service that orchestrates client and broker operations
 class MqttService extends ChangeNotifier {
@@ -60,9 +63,13 @@ class MqttService extends ChangeNotifier {
     _clientTracker.addListener(notifyListeners);
     // Listen to topic manager changes
     _topicManager.addListener(notifyListeners);
+    // Feed every worker's periodic metrics into the store (only the broker host
+    // subscribes to this topic, so this is a no-op on workers).
+    addMessageListener('clients/metrics', (topic, message) => MetricsStore.instance.ingestWire(message));
   }
   
   // Getters
+  MessageLogger get messageLogger => _logger;
   MqttClientManager get clientManager => _clientManager;
   bool get isConnected => _clientManager.isConnected;
   bool get isSubscribed => _clientManager.isSubscribed;
@@ -131,6 +138,14 @@ class MqttService extends ChangeNotifier {
     final success = await _brokerManager.startBroker();
     
     if (success) {
+      // PerformanceService is a lazy singleton: touch it so the host records its own
+      // metrics from the start instead of waiting for the Analytics tab to open.
+      PerformanceService.instance;
+      // Label this phone's own recording so it shows up by IP/name in exports
+      final hostIp = await NetworkHelper.getDeviceIPAddress();
+      if (hostIp != null) {
+        MetricsStore.instance.setLocalIdentity(hostIp, (await DeviceInfoHelper.getDeviceName()) ?? 'Host');
+      }
       // Connect a local client for the host to be able to publish messages
       await _setupHostPublishingClient();
       
@@ -261,6 +276,7 @@ class MqttService extends ChangeNotifier {
                 });
                 try {
                   await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
+                  TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
                   _logger.log('✅ Posted warmup results to host: $postUrl');
                   // Start client worker to fetch assignments and run inference on assigned units
                   try {

@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
 import 'message_logger.dart';
 import 'file_server_service.dart';
+import 'metrics/traffic_counter.dart';
 
 /// Manages file downloads for clients
 class FileDownloadService {
@@ -171,6 +172,7 @@ class FileDownloadService {
               }
 
               await raf.writeFrom(chunk);
+              TrafficCounter.instance.addRx(TrafficChannel.httpData, chunk.length);
               processedBytes += chunk.length;
               task.updateProgress(startByte + processedBytes);
               _onStateChanged?.call();

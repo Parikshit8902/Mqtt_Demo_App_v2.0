@@ -32,6 +32,16 @@ class AssignmentsClient {
     return null;
   }
 
+  Future<bool> postMetricsReport(Map<String, dynamic> report) async {
+    try {
+      await httpPostJson(Uri.parse('$serverBase/admin/metrics_report'), report);
+      return true;
+    } catch (e) {
+      _logger.log('⚠️ postMetricsReport error: $e');
+    }
+    return false;
+  }
+
   Future<bool> postResult(ResultReport rr) async {
     try {
       final url = Uri.parse('$serverBase/assignments/${rr.jobId}/results');

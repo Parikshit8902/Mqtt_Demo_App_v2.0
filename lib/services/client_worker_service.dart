@@ -7,6 +7,8 @@ import 'assignments_client.dart';
 import 'models/result_dto.dart';
 import 'inference_service.dart';
 import 'utils/metrics.dart';
+import 'metrics/metrics_store.dart';
+import 'metrics/traffic_counter.dart';
 
 class ClientWorkerService extends ChangeNotifier {
   final MessageLogger _logger;
@@ -14,6 +16,7 @@ class ClientWorkerService extends ChangeNotifier {
   final InferenceService _inferenceService;
 
   bool _running = false;
+  bool _didWork = false; // processed units since the last report upload
   String jobId;
   String clientId;
 
@@ -25,6 +28,7 @@ class ClientWorkerService extends ChangeNotifier {
     if (_running) return;
     _running = true;
     notifyListeners();
+    MetricsStore.instance.setLocalIdentity(deviceKeyFromClientId(clientId), deviceNameFromClientId(clientId));
     _logger.log('🚧 Client worker started for job $jobId');
     // Ensure model is loaded
     await _inferenceService.loadModel();
@@ -33,6 +37,11 @@ class ClientWorkerService extends ChangeNotifier {
       try {
         final assignment = await _assignClient.requestNext(jobId, clientId);
         if (assignment == null || assignment.units.isEmpty) {
+          if (_didWork) {
+            // Work just ran dry: hand the host this phone's full recording.
+            _didWork = false;
+            await pushMetricsReport();
+          }
           _logger.log('ℹ️ No assignments available, sleeping 2s');
           await Future.delayed(const Duration(seconds: 2));
           continue;
@@ -51,9 +60,15 @@ class ClientWorkerService extends ChangeNotifier {
             if (needsRange) {
               req.headers['Range'] = 'bytes=${unit.start}-${unit.end}';
             }
+            // Time the download on its own: this is what the scheduler needs as the
+            // phone's link speed. (It used to be derived from inference time.)
+            final unitSw = Stopwatch()..start();
+            final dlSw = Stopwatch()..start();
             final streamed = await req.send();
             if (streamed.statusCode == 200 || streamed.statusCode == 206) {
               final bytes = await streamed.stream.toBytes();
+              dlSw.stop();
+              TrafficCounter.instance.addRx(TrafficChannel.httpData, bytes.length);
               // Run inference on bytes
               final sw = Stopwatch()..start();
               Map<String, dynamic> inferRes = {};
@@ -64,14 +79,33 @@ class ClientWorkerService extends ChangeNotifier {
               }
               sw.stop();
               final ttMs = sw.elapsedMilliseconds;
-              // For bandwidth estimate, use helper
-              final bwKbps = computeBandwidthKbpsFromMs(bytes.length, ttMs);
+              // Effective download throughput (includes request latency and the host's
+              // time to produce the bytes, which is what a scheduler should plan with).
+              final dlMs = dlSw.elapsedMilliseconds < 1 ? 1 : dlSw.elapsedMilliseconds;
+              final bwKbps = computeBandwidthKbpsFromMs(bytes.length, dlMs);
+              final totalMs = unitSw.elapsedMilliseconds;
 
               final detections = inferRes['boxes'] ?? inferRes['detections'] ?? [];
-              final rr = ResultReport(jobId: jobId, clientId: clientId, unitIndex: unit.unitIndex, ttprocMs: ttMs, bandwidthKbps: bwKbps, detections: (detections as List<dynamic>?), resultUri: null, warmup: false);
+              final rr = ResultReport(jobId: jobId, clientId: clientId, unitIndex: unit.unitIndex, ttprocMs: ttMs, bandwidthKbps: bwKbps, bytes: bytes.length, downloadMs: dlMs, totalMs: totalMs, detections: (detections as List<dynamic>?), resultUri: null, warmup: false);
+              MetricsStore.instance.recordUnit(
+                deviceKeyFromClientId(clientId),
+                UnitRecord(
+                  deviceKey: deviceKeyFromClientId(clientId),
+                  jobId: jobId,
+                  unitIndex: unit.unitIndex,
+                  bytes: bytes.length,
+                  downloadMs: dlMs,
+                  inferMs: ttMs,
+                  totalMs: totalMs,
+                  downloadKBps: bwKbps,
+                  scheduler: '',
+                  t: DateTime.now().millisecondsSinceEpoch,
+                ),
+              );
+              _didWork = true;
               final ok = await _assignClient.postResult(rr);
               if (ok) {
-                _logger.log('✅ Posted result for unit ${unit.unitIndex} (tt=${ttMs}ms bw=${bwKbps.toStringAsFixed(1)}kB/s)');
+                _logger.log('✅ Posted result for unit ${unit.unitIndex} (infer=${ttMs}ms download=${dlMs}ms bw=${bwKbps.toStringAsFixed(1)}kB/s)');
               } else {
                 _logger.log('⚠️ Failed to post result for unit ${unit.unitIndex}');
               }
@@ -90,6 +124,14 @@ class ClientWorkerService extends ChangeNotifier {
 
     _logger.log('🛑 Client worker stopped');
     notifyListeners();
+  }
+
+  /// Upload this phone's full recording (2 s samples, per-unit records, traffic
+  /// breakdown) to the host so it can be exported alongside every other phone.
+  Future<bool> pushMetricsReport() async {
+    final ok = await _assignClient.postMetricsReport(MetricsStore.instance.localReport());
+    _logger.log(ok ? '📊 Uploaded metrics report to host' : '⚠️ Failed to upload metrics report');
+    return ok;
   }
 
   void stop() {
