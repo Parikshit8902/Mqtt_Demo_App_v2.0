@@ -1,179 +1,139 @@
-import 'dart:math';
-
 import '../models/assignment.dart';
-import '../models/result_dto.dart';
-import 'scheduler.dart';
-import 'scheduler_utils.dart';
+import 'dynamic_scheduler.dart';
+import 'scheduling_model.dart';
 
-class PSOScheduler implements Scheduler {
+/// Particle swarm scheduler (DetectNet's `schedPSO`): for every unit a small
+/// swarm searches for one weight per open phone, and the phone with the largest
+/// weight in the final global best receives the unit.
+///
+/// A particle is a vector of weights in [0, 1] and its fitness is the weighted
+/// average of the phones' health scores, sum(|w| * s) / sum(|w|). Each
+/// iteration moves every weight by the usual velocity-style rule
+///
+///   x = inertia * x + c1 * r1 * (pbest - x) + c2 * r2 * (gbest - x)
+///
+/// and clamps it back into [0, 1].
+///
+/// What makes it dynamic is its input: the scores are
+/// [FleetModel.healthScore], which is recomputed from live battery, CPU load,
+/// bandwidth, processing rate (already derated for thermal state, memory and
+/// Wi-Fi signal) and queue depth. The swarm is rebuilt for every pick and every
+/// assignment lengthens the winner's queue before the next one, so a batch
+/// spreads over the phones instead of piling onto whichever scored best first.
+///
+/// As in DetectNet this is a lightweight heuristic, not a converged discrete
+/// task-assignment PSO. The fitness is a weighted average, so the swarm drifts
+/// towards putting the most weight on the healthiest phone; in effect it ranks
+/// phones by health, with some randomness left over from the short search.
+class PSOScheduler extends DynamicScheduler {
+  final int particles;
+  final int iterations;
+  final double inertia;
+  final double c1;
+  final double c2;
+
+  PSOScheduler({
+    super.random,
+    super.config,
+    this.particles = 8,
+    this.iterations = 6,
+    this.inertia = 0.72,
+    this.c1 = 1.49,
+    this.c2 = 1.49,
+  }) : assert(particles > 0),
+       assert(iterations >= 0);
+
   @override
   String get id => 'pso';
+
   @override
   String get label => 'PSO';
 
-  final Random _random = Random();
-
   @override
-  Map<String, List<Unit>> schedule(
-    List<Unit> availableUnits,
-    Map<String, ClientEstimate> clients,
-    int maxUnitPerAssign,
-  ) {
-    final assignments =
-        SchedulerUtils.initializeAssignments(clients);
+  String pick(FleetModel fleet, List<String> open, Unit unit) {
+    // Sorted so a seeded Random gives the same weights to the same phones
+    // whatever order the clients happen to be in the map.
+    final clientIds = List<String>.of(open)..sort();
 
-    if (availableUnits.isEmpty || clients.isEmpty) {
-      return assignments;
-    }
+    final scores = [
+      for (final clientId in clientIds) fleet.healthScore(clientId),
+    ];
 
-    if (clients.length == 1) {
-      final clientId = clients.keys.first;
-
-      assignments[clientId]!.addAll(
-        availableUnits.take(maxUnitPerAssign),
-      );
-
-      return assignments;
-    }
-
-    final clientIds = clients.keys.toList();
-
-    final healthScores =
-        SchedulerUtils.healthScores(clients);
-
-    final scores = clientIds
-        .map((id) => healthScores[id] ?? 0.0)
-        .toList();
-
-    const particleCount = 8;
-    const iterations = 6;
-
-    // Each particle represents a vector of weights,
-    // one weight for every client.
-    List<List<double>> particles = List.generate(
-      particleCount,
-      (_) => List.generate(
-        clientIds.length,
-        (_) => _random.nextDouble(),
-      ),
+    final swarm = List.generate(
+      particles,
+      (_) => List.generate(clientIds.length, (_) => random.nextDouble()),
     );
 
-    List<List<double>> personalBest = particles
-        .map((particle) => List<double>.from(particle))
-        .toList();
+    final personalBest = [
+      for (final particle in swarm) List<double>.of(particle),
+    ];
 
-    List<double> globalBest =
-        List<double>.from(particles.first);
+    final personalBestFitness = [
+      for (final particle in swarm) _fitness(particle, scores),
+    ];
 
-    double globalBestFitness =
-        _fitness(globalBest, scores);
+    // The best of the initial swarm, not simply the first particle.
+    var bestParticle = 0;
+    for (int i = 1; i < swarm.length; i++) {
+      if (personalBestFitness[i] > personalBestFitness[bestParticle]) {
+        bestParticle = i;
+      }
+    }
+
+    var globalBest = List<double>.of(swarm[bestParticle]);
+    var globalBestFitness = personalBestFitness[bestParticle];
 
     for (int iteration = 0; iteration < iterations; iteration++) {
-      for (int particleIndex = 0;
-          particleIndex < particles.length;
-          particleIndex++) {
-        final particle = particles[particleIndex];
-        final personal = personalBest[particleIndex];
+      for (int p = 0; p < swarm.length; p++) {
+        final particle = swarm[p];
 
         for (int i = 0; i < particle.length; i++) {
-          final r1 = _random.nextDouble();
-          final r2 = _random.nextDouble();
+          final r1 = random.nextDouble();
+          final r2 = random.nextDouble();
 
           particle[i] =
-              (0.72 * particle[i]) +
-              (1.49 * r1 * (personal[i] - particle[i])) +
-              (1.49 * r2 * (globalBest[i] - particle[i]));
+              (inertia * particle[i]) +
+              (c1 * r1 * (personalBest[p][i] - particle[i])) +
+              (c2 * r2 * (globalBest[i] - particle[i]));
 
           particle[i] = particle[i].clamp(0.0, 1.0);
         }
 
-        final currentFitness =
-            _fitness(particle, scores);
+        final fitness = _fitness(particle, scores);
 
-        final personalFitness =
-            _fitness(personal, scores);
-
-        if (currentFitness > personalFitness) {
-          personalBest[particleIndex] =
-              List<double>.from(particle);
+        if (fitness > personalBestFitness[p]) {
+          personalBest[p] = List<double>.of(particle);
+          personalBestFitness[p] = fitness;
         }
 
-        if (currentFitness > globalBestFitness) {
-          globalBest =
-              List<double>.from(particle);
-
-          globalBestFitness = currentFitness;
+        if (fitness > globalBestFitness) {
+          globalBest = List<double>.of(particle);
+          globalBestFitness = fitness;
         }
       }
     }
 
-    // Rank clients using the final PSO global-best vector.
-    final ranking = List<int>.generate(
-      clientIds.length,
-      (index) => index,
-    );
-
-    ranking.sort(
-      (a, b) => globalBest[b].compareTo(globalBest[a]),
-    );
-
-    // Assign units to the best available client first,
-    // then continue through the ranking.
-    int rankingIndex = 0;
-
-    for (final unit in availableUnits) {
-      bool assigned = false;
-
-      for (int attempt = 0;
-          attempt < ranking.length;
-          attempt++) {
-        final index =
-            (rankingIndex + attempt) % ranking.length;
-
-        final clientId = clientIds[index];
-
-        if (assignments[clientId]!.length <
-            maxUnitPerAssign) {
-          assignments[clientId]!.add(unit);
-
-          rankingIndex =
-              (index + 1) % ranking.length;
-
-          assigned = true;
-          break;
-        }
-      }
-
-      if (!assigned) {
-        break;
+    // The ids are sorted, so the strict comparison leaves an exact tie with
+    // the lexicographically smaller id.
+    var winner = 0;
+    for (int i = 1; i < globalBest.length; i++) {
+      if (globalBest[i] > globalBest[winner]) {
+        winner = i;
       }
     }
 
-    return assignments;
+    return clientIds[winner];
   }
 
-  double _fitness(
-    List<double> weights,
-    List<double> scores,
-  ) {
-    if (weights.isEmpty) {
-      return 0.0;
-    }
-
+  double _fitness(List<double> weights, List<double> scores) {
     double weightSum = 0.0;
-    double fitness = 0.0;
+    double weighted = 0.0;
 
     for (int i = 0; i < weights.length; i++) {
       weightSum += weights[i].abs();
-
-      fitness +=
-          weights[i].abs() * scores[i];
+      weighted += weights[i].abs() * scores[i];
     }
 
-    if (weightSum == 0.0) {
-      return 0.0;
-    }
-
-    return fitness / weightSum;
+    return weightSum == 0.0 ? 0.0 : weighted / weightSum;
   }
 }

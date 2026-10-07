@@ -1,158 +1,49 @@
 import '../models/assignment.dart';
-import '../models/result_dto.dart';
-import 'scheduler.dart';
-import 'scheduler_utils.dart';
+import 'dynamic_scheduler.dart';
+import 'scheduling_model.dart';
 
-class MOMPSOScheduler implements Scheduler {
+/// Multi-objective scheduler (DetectNet's `schedMOMPSO`): every phone gets one
+/// weighted score and the unit goes to the phone with the highest.
+///
+///   score = w.health * health - w.latency * latency - w.queue * queue - w.energy * energy
+///
+/// Each term is computed by [FleetModel.objective] from live device state, so
+/// this class only decides which weights to use and takes the argmax. Units are
+/// handed out one at a time and every assignment lengthens the winner's queue,
+/// which is what moves the next unit to a different phone once the best one is
+/// busy.
+///
+/// Two weight sets are provided, switch by passing `weights`:
+///  * [ObjectiveWeights.dynamicMompso] (default): the original weights scaled by
+///    0.8 with the remaining 0.2 on energy (health 0.40, latency 0.24,
+///    queue 0.16, energy 0.20). The energy term is what separates two
+///    otherwise equal phones, so a phone on a charger or a lower-power SoC wins.
+///  * [ObjectiveWeights.detectnetMompso]: DetectNet's original three terms with
+///    no energy (health 0.50, latency 0.30, queue 0.20), for comparing against
+///    the web app.
+///
+/// Deterministic: ties are broken by client id, so [random] is accepted only to
+/// keep the constructor uniform across the four schedulers.
+class MOMPSOScheduler extends DynamicScheduler {
+  final ObjectiveWeights weights;
+
+  MOMPSOScheduler({
+    super.random,
+    super.config,
+    this.weights = ObjectiveWeights.dynamicMompso,
+  });
+
   @override
   String get id => 'mompso';
+
   @override
   String get label => 'MOMPSO';
 
   @override
-  Map<String, List<Unit>> schedule(
-    List<Unit> availableUnits,
-    Map<String, ClientEstimate> clients,
-    int maxUnitPerAssign,
-  ) {
-    final assignments =
-        SchedulerUtils.initializeAssignments(clients);
-
-    if (availableUnits.isEmpty || clients.isEmpty) {
-      return assignments;
-    }
-
-    final healthScores =
-        SchedulerUtils.healthScores(clients);
-
-    final clientIds = clients.keys.toList();
-
-    // Current objective:
-    //
-    // 50% -> overall health/performance
-    // 30% -> processing efficiency
-    // 20% -> bandwidth efficiency
-    //
-    // Later this can be extended to:
-    // battery + CPU + latency + queue depth + energy.
-
-    final minTtproc = clients.values
-        .map((e) => e.ttprocMs)
-        .reduce((a, b) => a < b ? a : b);
-
-    final maxTtproc = clients.values
-        .map((e) => e.ttprocMs)
-        .reduce((a, b) => a > b ? a : b);
-
-    final minBandwidth = clients.values
-        .map((e) => e.bandwidthKbps)
-        .reduce((a, b) => a < b ? a : b);
-
-    final maxBandwidth = clients.values
-        .map((e) => e.bandwidthKbps)
-        .reduce((a, b) => a > b ? a : b);
-
-    final objectiveScores = <String, double>{};
-
-    for (final clientId in clientIds) {
-      final estimate = clients[clientId]!;
-
-      final processingScore =
-          _inverseNormalize(
-        estimate.ttprocMs,
-        minTtproc,
-        maxTtproc,
-      );
-
-      final bandwidthScore =
-          _normalize(
-        estimate.bandwidthKbps,
-        minBandwidth,
-        maxBandwidth,
-      );
-
-      final healthScore =
-          healthScores[clientId] ?? 0.0;
-
-      objectiveScores[clientId] =
-          (healthScore * 0.5) +
-          (processingScore * 0.3) +
-          (bandwidthScore * 0.2);
-    }
-
-    final ranking = clientIds.toList();
-
-    ranking.sort(
-      (a, b) => objectiveScores[b]!
-          .compareTo(objectiveScores[a]!),
+  String pick(FleetModel fleet, List<String> open, Unit unit) {
+    return DynamicScheduler.argmax(
+      open,
+      (clientId) => fleet.objective(clientId, weights),
     );
-
-    _assignUsingRanking(
-      availableUnits,
-      ranking,
-      assignments,
-      maxUnitPerAssign,
-    );
-
-    return assignments;
-  }
-
-  void _assignUsingRanking(
-    List<Unit> units,
-    List<String> ranking,
-    Map<String, List<Unit>> assignments,
-    int maxUnits,
-  ) {
-    int rankingIndex = 0;
-
-    for (final unit in units) {
-      bool assigned = false;
-
-      for (int attempt = 0;
-          attempt < ranking.length;
-          attempt++) {
-        final index =
-            (rankingIndex + attempt) % ranking.length;
-
-        final clientId = ranking[index];
-
-        if (assignments[clientId]!.length <
-            maxUnits) {
-          assignments[clientId]!.add(unit);
-
-          rankingIndex =
-              (index + 1) % ranking.length;
-
-          assigned = true;
-          break;
-        }
-      }
-
-      if (!assigned) {
-        break;
-      }
-    }
-  }
-
-  double _normalize(
-    double value,
-    double min,
-    double max,
-  ) {
-    if ((max - min).abs() < 0.000001) {
-      return 1.0;
-    }
-
-    return ((value - min) / (max - min))
-        .clamp(0.0, 1.0);
-  }
-
-  double _inverseNormalize(
-    double value,
-    double min,
-    double max,
-  ) {
-    return 1.0 -
-        _normalize(value, min, max);
   }
 }

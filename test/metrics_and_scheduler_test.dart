@@ -36,7 +36,16 @@ void main() {
         for (final l in out.values) {
           expect(l.length, lessThanOrEqualTo(3));
         }
-        expect(all.length, 9, reason: '3 clients x 3 units of capacity');
+        if (id == 'round_robin' || id == 'random') {
+          expect(all.length, 9, reason: 'baselines fill every slot: 3 clients x 3 units');
+        } else {
+          // Live-data schedulers cap slower phones lower per round, but every
+          // eligible phone is still offered at least one unit.
+          expect(all.length, inInclusiveRange(3, 9));
+          for (final l in out.values) {
+            expect(l, isNotEmpty);
+          }
+        }
       });
 
       test('$id tolerates no clients', () {

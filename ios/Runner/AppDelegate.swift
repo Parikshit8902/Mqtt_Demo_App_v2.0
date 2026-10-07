@@ -1,6 +1,7 @@
 import Flutter
 import UIKit
 import Darwin
+import os
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
@@ -30,7 +31,14 @@ import Darwin
 ///  - Disk:    not available (keys omitted; Dart skips them).
 ///  - Battery: percentage only. No current/voltage API, so measured power is
 ///             unavailable and only the modelled estimate is produced.
+///  - Health:  `getDeviceHealth` reports physical memory, headroom before the system
+///             kills the app, thermal state and charging. Wi-Fi RSSI/link speed and
+///             battery temperature are not exposed to apps on iOS, so those keys are omitted.
 final class PerformanceChannel {
+  // Below this headroom iOS is close to terminating the app, which is the nearest
+  // equivalent of Android's lowMemory flag.
+  private let lowMemoryHeadroomBytes = 100 * 1024 * 1024
+
   // en0 byte counters are 32-bit and wrap at 4 GiB; accumulate into 64-bit.
   private var lastRx: UInt32 = 0
   private var lastTx: UInt32 = 0
@@ -52,16 +60,57 @@ final class PerformanceChannel {
       case "getBatteryDetails":
         UIDevice.current.isBatteryMonitoringEnabled = true
         let level = UIDevice.current.batteryLevel // -1 when unknown (e.g. Simulator)
-        result(level < 0 ? 0 : Int((level * 100).rounded()))
+        // -1 = unknown (Simulator). Reporting 0 would make the scheduler think the battery is empty.
+        result(level < 0 ? -1 : Int((level * 100).rounded()))
       case "getPowerDetails":
         UIDevice.current.isBatteryMonitoringEnabled = true
         let state = UIDevice.current.batteryState
         // No current/voltage on iOS: Dart treats a missing current as "unmeasured".
         result(["charging": state == .charging || state == .full])
+      case "getDeviceHealth":
+        result(self.deviceHealth())
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  /// Live device state for the dynamic schedulers. A key is omitted rather than guessed
+  /// when iOS cannot report it; the Dart side treats an absent key as unknown.
+  private func deviceHealth() -> [String: Any] {
+    var health: [String: Any] = [:]
+    let bytesPerMB = 1024.0 * 1024.0
+
+    health["memTotalMb"] = Double(ProcessInfo.processInfo.physicalMemory) / bytesPerMB
+
+    // iOS has no "free RAM" figure for apps; the headroom before the system kills this
+    // app is the usable equivalent. It returns 0 both when it cannot answer (not an app)
+    // and when the limit is already exceeded (the app would be dead), so 0 means unknown.
+    if #available(iOS 13.0, *) {
+      let headroom = os_proc_available_memory()
+      if headroom > 0 {
+        health["memFreeMb"] = Double(headroom) / bytesPerMB
+        health["lowMemory"] = headroom < lowMemoryHeadroomBytes
+      }
+    }
+
+    // Values follow Android's THERMAL_STATUS_* scale (which has MODERATE = 2 between
+    // fair and serious), so the Dart side can interpret both platforms identically.
+    switch ProcessInfo.processInfo.thermalState {
+    case .nominal: health["thermalStatus"] = 0
+    case .fair: health["thermalStatus"] = 1
+    case .serious: health["thermalStatus"] = 3
+    case .critical: health["thermalStatus"] = 4
+    @unknown default: break
+    }
+
+    UIDevice.current.isBatteryMonitoringEnabled = true
+    let batteryState = UIDevice.current.batteryState
+    if batteryState != .unknown {
+      health["charging"] = batteryState == .charging || batteryState == .full
+    }
+
+    return health
   }
 
   private func performanceMetrics() -> [String: Int] {

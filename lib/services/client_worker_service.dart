@@ -9,6 +9,7 @@ import 'inference_service.dart';
 import 'utils/metrics.dart';
 import 'metrics/metrics_store.dart';
 import 'metrics/traffic_counter.dart';
+import 'performance_service.dart';
 
 class ClientWorkerService extends ChangeNotifier {
   final MessageLogger _logger;
@@ -86,7 +87,9 @@ class ClientWorkerService extends ChangeNotifier {
               final totalMs = unitSw.elapsedMilliseconds;
 
               final detections = inferRes['boxes'] ?? inferRes['detections'] ?? [];
-              final rr = ResultReport(jobId: jobId, clientId: clientId, unitIndex: unit.unitIndex, ttprocMs: ttMs, bandwidthKbps: bwKbps, bytes: bytes.length, downloadMs: dlMs, totalMs: totalMs, detections: (detections as List<dynamic>?), resultUri: null, warmup: false);
+              // Health rides along with the result so the host sees the phone's state at the
+              // moment it finished, which is fresher than the 5 s MQTT sample.
+              final rr = ResultReport(jobId: jobId, clientId: clientId, unitIndex: unit.unitIndex, ttprocMs: ttMs, bandwidthKbps: bwKbps, bytes: bytes.length, downloadMs: dlMs, totalMs: totalMs, detections: (detections as List<dynamic>?), resultUri: null, warmup: false, health: PerformanceService.instance.currentHealth);
               MetricsStore.instance.recordUnit(
                 deviceKeyFromClientId(clientId),
                 UnitRecord(

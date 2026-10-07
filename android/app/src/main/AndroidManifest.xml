@@ -2,7 +2,9 @@
     <!-- Network permissions for MQTT -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    
+    <!-- Wi-Fi RSSI and link speed for the dynamic schedulers' device health -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <application
         android:label="new_app_apk"
         android:name="${applicationName}"

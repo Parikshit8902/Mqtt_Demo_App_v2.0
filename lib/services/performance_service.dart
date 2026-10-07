@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart'; // Import for WidgetsBindingObserver
 import 'metrics/metrics_store.dart';
+import 'models/device_health.dart';
 import 'metrics/power_model.dart';
 import 'metrics/traffic_counter.dart';
 
@@ -22,6 +23,8 @@ class PerformanceData {
   final double? measuredPowerMw;
   /// Modelled draw of this app only, mW.
   final double modelPowerMw;
+  /// Live device state for the schedulers (thermal, RAM, Wi-Fi, charging...).
+  final DeviceHealth health;
 
   PerformanceData({
     this.cpuUsage = 0.0,
@@ -32,6 +35,7 @@ class PerformanceData {
     this.cpuDataPoints = const [],
     this.measuredPowerMw,
     this.modelPowerMw = 0.0,
+    this.health = DeviceHealth.unknown,
   });
 }
 
@@ -43,6 +47,8 @@ class PerformanceService with WidgetsBindingObserver {
   String get networkUsage => notifier.value.networkUsage;
   String get diskUsage => notifier.value.diskUsage;
   String get batteryLevel => notifier.value.batteryLevel;
+  /// Latest device health; [DeviceHealth.unknown] until the first tick completes.
+  DeviceHealth get currentHealth => notifier.value.health;
   // --- Singleton Setup ---
   PerformanceService._privateConstructor() {
     init();
@@ -181,9 +187,18 @@ class PerformanceService with WidgetsBindingObserver {
       _lastTimestamp = now;
 
       final cores = Platform.numberOfProcessors > 0 ? Platform.numberOfProcessors : 1;
+      final cpuNormPct = cpuUsage / cores;
       final modelMw = _powerModel.estimateMw(
         cpuCores: cpuUsage / 100.0,
         bytesPerSec: (rxKBps + txKBps) * 1024,
+      );
+
+      // Read after the rate bookkeeping above so the extra platform call cannot skew the next delta.
+      final health = await _readDeviceHealth(
+        at: now,
+        cpuNormPct: cpuNormPct,
+        batteryPct: currentBattery,
+        measuredPowerMw: measuredPowerMw,
       );
 
       // Record a sample for the metrics pipeline (needs a previous reading for rates).
@@ -191,7 +206,7 @@ class PerformanceService with WidgetsBindingObserver {
         MetricsStore.instance.recordLocal(MetricSample(
           t: now.millisecondsSinceEpoch,
           cpuPct: cpuUsage,
-          cpuNormPct: cpuUsage / cores,
+          cpuNormPct: cpuNormPct,
           memMb: currentMemory,
           rxKBps: rxKBps,
           txKBps: txKBps,
@@ -201,6 +216,7 @@ class PerformanceService with WidgetsBindingObserver {
           battery: currentBattery,
           measuredMw: measuredPowerMw,
           modelMw: modelMw,
+          health: health,
         ));
       }
 
@@ -210,10 +226,11 @@ class PerformanceService with WidgetsBindingObserver {
         memoryUsage: currentMemory,
         networkUsage: networkUsage,
         diskUsage: diskUsage,
-        batteryLevel: '$currentBattery%',
+        batteryLevel: currentBattery >= 0 ? '$currentBattery%' : 'N/A',
         cpuDataPoints: List.from(_cpuDataPoints),
         measuredPowerMw: measuredPowerMw,
         modelPowerMw: modelMw,
+        health: health,
       );
 
     } catch (e) {
@@ -240,6 +257,48 @@ class PerformanceService with WidgetsBindingObserver {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Native `getDeviceHealth` key -> [DeviceHealth] wire key. Going through the wire
+  /// keys keeps one parser, so its "unavailable" sentinels (RSSI -127, negative
+  /// thermal status, link speed <= 0) are handled in a single place.
+  static const Map<String, String> _nativeHealthKeys = {
+    'memFreeMb': 'fm',
+    'memTotalMb': 'tm',
+    'lowMemory': 'lm',
+    'batteryTempC': 'bt',
+    'thermalStatus': 'th',
+    'charging': 'chg',
+    'rssiDbm': 'rs',
+    'linkMbps': 'ls',
+  };
+
+  /// This tick's health: the values already measured here plus the native readings.
+  /// A platform that lacks `getDeviceHealth`, or a native failure, only leaves the
+  /// native fields unknown; it must not disturb the tick, so it is never rethrown.
+  Future<DeviceHealth> _readDeviceHealth({
+    required DateTime at,
+    required double cpuNormPct,
+    required int batteryPct,
+    required double? measuredPowerMw,
+  }) async {
+    final wire = <String, dynamic>{
+      'cn': cpuNormPct,
+      if (batteryPct >= 0) 'bp': batteryPct,
+      if (measuredPowerMw != null) 'pw': measuredPowerMw,
+    };
+    try {
+      final native = await platform.invokeMapMethod<String, dynamic>('getDeviceHealth');
+      if (native != null) {
+        _nativeHealthKeys.forEach((nativeKey, wireKey) {
+          final value = native[nativeKey];
+          if (value != null) wire[wireKey] = value;
+        });
+      }
+    } catch (_) {
+      // Deliberately silent: an unimplemented method would otherwise log every 2 s.
+    }
+    return DeviceHealth.fromWire(wire, updatedAtMs: at.millisecondsSinceEpoch);
   }
 
   final PowerModel _powerModel = PowerModel.defaults;

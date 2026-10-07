@@ -18,8 +18,10 @@ import 'network_helper.dart';
 import 'client_metrics_publisher.dart';
 import 'performance_service.dart';
 import 'device_info_helper.dart';
+import 'distribution_singleton.dart';
 import 'metrics/metrics_store.dart';
 import 'metrics/traffic_counter.dart';
+import 'models/device_health.dart';
 
 /// Main MQTT service that orchestrates client and broker operations
 class MqttService extends ChangeNotifier {
@@ -66,6 +68,26 @@ class MqttService extends ChangeNotifier {
     // Feed every worker's periodic metrics into the store (only the broker host
     // subscribes to this topic, so this is a no-op on workers).
     addMessageListener('clients/metrics', (topic, message) => MetricsStore.instance.ingestWire(message));
+    // The same samples tell the scheduler how each phone is doing right now.
+    addMessageListener('clients/metrics', _feedSchedulerHealth);
+  }
+
+  /// Hand a worker's live health (battery, thermal, RAM, Wi-Fi, CPU) to the
+  /// distribution manager. Samples are keyed by device IP, which it matches
+  /// against the registered client ids.
+  void _feedSchedulerHealth(String topic, String message) {
+    try {
+      final j = jsonDecode(message);
+      if (j is! Map<String, dynamic>) return;
+      final key = j['i'];
+      if (key is! String || key.isEmpty) return;
+      distributionManager.updateClientHealth(
+        key,
+        DeviceHealth.fromWire(j, updatedAtMs: DateTime.now().millisecondsSinceEpoch),
+      );
+    } catch (_) {
+      // A malformed sample is dropped; the next one arrives within seconds.
+    }
   }
   
   // Getters

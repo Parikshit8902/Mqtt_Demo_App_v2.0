@@ -435,8 +435,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.TrafficStats
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.PowerManager
 import android.system.Os
 import android.system.OsConstants
 import io.flutter.embedding.android.FlutterActivity
@@ -447,6 +449,10 @@ import java.lang.Exception
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.mqtt_demo/performance"
+
+    // WifiInfo.INVALID_RSSI is a hidden API, so its value is spelled out here.
+    private val INVALID_RSSI_DBM = -127
+    private val BYTES_PER_MB = 1024.0 * 1024.0
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -492,6 +498,9 @@ class MainActivity: FlutterActivity() {
                         result.error("POWER_ERROR", "Failed to read power details", e.localizedMessage)
                     }
                 }
+
+                // Live device state for the dynamic schedulers (memory, thermal, charging, Wi-Fi link).
+                "getDeviceHealth" -> result.success(deviceHealth())
 
                 "getBatteryDetails" -> {
                     val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
@@ -588,5 +597,53 @@ class MainActivity: FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    // Each sensor is read in isolation so one that is missing or throws (vendor quirks,
+    // a revoked permission) does not drop the others. A key is omitted rather than
+    // guessed whenever its source is unavailable; the Dart side treats absent as unknown.
+    private fun deviceHealth(): Map<String, Any> {
+        val health = mutableMapOf<String, Any>()
+
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mem = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mem)
+            health["memFreeMb"] = mem.availMem / BYTES_PER_MB
+            health["memTotalMb"] = mem.totalMem / BYTES_PER_MB
+            health["lowMemory"] = mem.lowMemory
+        } catch (e: Exception) { /* memory keys stay absent */ }
+
+        try {
+            // ACTION_BATTERY_CHANGED is sticky: a null receiver just returns the last broadcast.
+            val battery: Intent? = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (battery != null) {
+                // The platform reports temperature in tenths of a degree Celsius.
+                val tenthsC = battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+                if (tenthsC != Int.MIN_VALUE) health["batteryTempC"] = tenthsC / 10.0
+                val plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
+                if (plugged >= 0) health["charging"] = plugged != 0
+            }
+        } catch (e: Exception) { /* battery keys stay absent */ }
+
+        // getCurrentThermalStatus() only exists from API 29; older devices omit the key.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                health["thermalStatus"] = pm.currentThermalStatus
+            } catch (e: Exception) { /* thermal key stays absent */ }
+        }
+
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            // Deprecated since API 31, but it still returns RSSI and link speed for the app's
+            // own connection; only SSID/BSSID-style fields are redacted without location access.
+            @Suppress("DEPRECATION")
+            val link = wifi.connectionInfo
+            if (link.rssi != INVALID_RSSI_DBM) health["rssiDbm"] = link.rssi
+            if (link.linkSpeed > 0) health["linkMbps"] = link.linkSpeed
+        } catch (e: Exception) { /* Wi-Fi keys stay absent */ }
+
+        return health
     }
 }

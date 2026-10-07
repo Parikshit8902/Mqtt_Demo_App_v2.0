@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import '../models/device_health.dart';
 import 'traffic_counter.dart';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,10 @@ class MetricSample {
   double energyModelJ; // cumulative, modelled
   double energyMeasuredJ; // cumulative, measured (whole device)
 
+  /// Live device state at sample time (thermal, RAM, Wi-Fi...). Null when none
+  /// of it is known.
+  final DeviceHealth? health;
+
   MetricSample({
     required this.t,
     required this.cpuPct,
@@ -64,9 +69,11 @@ class MetricSample {
     required this.modelMw,
     this.energyModelJ = 0,
     this.energyMeasuredJ = 0,
+    this.health,
   });
 
   /// Compact keys: 'c','m','b','t' match the original `clients/metrics` payload.
+  /// Health keys are appended only when known, so old hosts just ignore them.
   Map<String, dynamic> toWire() => {
         't': t,
         'c': double.parse(cpuPct.toStringAsFixed(2)),
@@ -82,6 +89,9 @@ class MetricSample {
         'pm': double.parse(modelMw.toStringAsFixed(0)),
         'e': double.parse(energyModelJ.toStringAsFixed(2)),
         if (energyMeasuredJ > 0) 'em': double.parse(energyMeasuredJ.toStringAsFixed(2)),
+        // 'cn' and 'pw' already appear above with the same meaning; the sample's own
+        // values stay authoritative so a key is never emitted twice or with two values.
+        if (health != null) ...(health!.toWire()..remove('cn')..remove('pw')),
       };
 
   factory MetricSample.fromWire(Map<String, dynamic> j) {
@@ -90,9 +100,10 @@ class MetricSample {
     if (bat is num) {
       battery = bat.toInt();
     } else if (bat is String) {
-      battery = int.tryParse(RegExp(r'\d+').firstMatch(bat)?.group(0) ?? '') ?? -1;
+      battery = int.tryParse(RegExp(r'-?\d+').firstMatch(bat)?.group(0) ?? '') ?? -1;
     }
     final c = _d(j['c']);
+    final health = DeviceHealth.fromWire(j);
     return MetricSample(
       t: _i(j['t']),
       cpuPct: c,
@@ -108,19 +119,28 @@ class MetricSample {
       modelMw: _d(j['pm']),
       energyModelJ: _d(j['e']),
       energyMeasuredJ: _d(j['em']),
+      health: health.isUnknown ? null : health,
     );
   }
 
+  // The health columns come last so exports made before they existed keep their layout.
   static const csvHeader = [
     'device', 'name', 'time_ms', 'cpu_pct', 'cpu_norm_pct', 'mem_mb', 'rx_kBps', 'tx_kBps',
     'rx_bytes_onwire', 'tx_bytes_onwire', 'payload_bytes', 'battery_pct', 'power_measured_mw',
     'power_model_mw', 'energy_model_j', 'energy_measured_j',
+    'thermal_status', 'rssi_dbm', 'link_mbps', 'mem_free_mb', 'mem_total_mb', 'low_memory', 'charging',
+    'battery_temp_c',
   ];
 
+  /// Flags are written 1/0 like on the wire; an unknown value is an empty cell.
   List<Object?> csvCells(String device, String name) => [
         device, name, t, cpuPct, cpuNormPct, memMb, rxKBps, txKBps, rxBytes, txBytes, payloadBytes,
         battery, measuredMw, modelMw, energyModelJ, energyMeasuredJ,
+        health?.thermalStatus, health?.rssiDbm, health?.linkMbps, health?.memFreeMb, health?.memTotalMb,
+        _flag(health?.lowMemory), _flag(health?.charging), health?.batteryTempC,
       ];
+
+  static int? _flag(bool? v) => v == null ? null : (v ? 1 : 0);
 }
 
 /// Per work-unit record (one image / chunk processed by one phone).

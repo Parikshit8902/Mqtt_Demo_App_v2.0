@@ -234,6 +234,10 @@ class FileServerService {
 
       MetricsStore.instance.schedulerId = distributionManager.schedulerId;
 
+      // Units reclaimed from a phone that stopped answering show up in the
+      // host log next to the assignments they affect.
+      distributionManager.onLog = _logger.log;
+
       final handler = shelf.Pipeline()
           .addMiddleware(logMiddleware)
           .addMiddleware(_trafficMiddleware())
@@ -758,6 +762,19 @@ class FileServerService {
   // WARMUP
   // ---------------------------------------------------------------------------
 
+  /// Id the current job is registered under: the most recently shared dataset
+  /// (zip / coco), or 'demo_job' when none has been shared.
+  String _currentJobId() {
+    for (final f in _sharedFiles.values.toList().reversed) {
+      if (f.mimeType == 'application/zip' ||
+          f.name.toLowerCase().contains('coco')) {
+        return f.id;
+      }
+    }
+
+    return 'demo_job';
+  }
+
   /// Handle warmup reports posted by clients.
   Future<shelf.Response> _handleWarmupReport(
     shelf.Request request,
@@ -810,20 +827,14 @@ class FileServerService {
         // register a small demo job so we can show
         // scheduling results.
         try {
-          final prog =
-              distributionManager.jobProgress(
-            'demo_job',
-          );
-
-          final totalUnits =
-              (prog['total'] is int)
-                  ? prog['total'] as int
-                  : int.tryParse(
-                        '${prog['total']}',
-                      ) ??
-                      0;
-
-          if (totalUnits == 0) {
+          // The job is registered under the dataset's id (or 'demo_job' when
+          // there is no dataset), so that is what must be checked. Checking
+          // only 'demo_job' never matched, so every phone's warmup rebuilt the
+          // job and reset the status of units that were already done or in
+          // flight, and they were handed out again.
+          if (!distributionManager.hasJob(
+            _currentJobId(),
+          )) {
             // Prefer a recently shared dataset
             // (zip / coco) to create units from.
             _logger.log(
@@ -1912,12 +1923,21 @@ class FileServerService {
         }
       } catch (_) {}
 
+      // Asking for work proves the phone is alive, even before it has
+      // finished a unit or sent any metrics.
+      distributionManager.touchClient(clientId);
+
       final units =
           distributionManager.assignNext(
         jobId,
         clientId,
         maxUnits: maxUnits,
       );
+
+      // Read straight after the call: it is the decision that produced
+      // these units, not a later preview.
+      final trace =
+          distributionManager.lastDecisionTrace;
 
       final assignment =
           PerClientAssignment(
@@ -1984,6 +2004,7 @@ class FileServerService {
                   (u) => u.unitIndex,
                 )
                 .toList(),
+            'trace': trace,
           },
         );
 
@@ -2106,17 +2127,14 @@ class FileServerService {
       final rr =
           ResultReport.fromJson(j);
 
-      // Mark unit complete and update client estimate.
+      // Mark unit complete, then fold the report (estimate, latency and the
+      // health the phone attached) into that client's live state.
       distributionManager.markUnitComplete(
         jobId,
         rr.unitIndex,
       );
 
-      distributionManager.updateClientEstimate(
-        rr.clientId,
-        rr.ttprocMs.toDouble(),
-        rr.bandwidthKbps,
-      );
+      distributionManager.recordResult(rr);
 
       _logger.log(
         '✅ Result received for job '

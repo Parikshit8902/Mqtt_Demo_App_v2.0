@@ -1,21 +1,55 @@
+import 'metrics/metrics_store.dart'
+    show deviceKeyFromClientId, deviceNameFromClientId;
 import 'models/assignment.dart';
+import 'models/device_health.dart';
 import 'models/result_dto.dart';
+import 'schedulers/dynamic_scheduler.dart';
 import 'schedulers/scheduler.dart';
 import 'schedulers/scheduler_type.dart';
 import 'schedulers/scheduler_factory.dart';
 import 'schedulers/scheduler_registry.dart';
+import 'schedulers/scheduling_model.dart';
 
 class DistributionManager {
+  /// How long a unit may stay assigned without a result before it is handed
+  /// back to the pool. A phone that crashes or drops off Wi-Fi would otherwise
+  /// strand its units (and its queue depth) forever.
+  final int leaseMs;
+
+  /// A phone the host has not heard from for longer than this is left out of
+  /// scheduling decisions, so a dead phone cannot keep winning picks and
+  /// starve the phone that is actually asking for work.
+  final int activeWindowMs;
+
+  /// Optional sink for notable events (a unit reclaimed after its lease
+  /// expired). The file server points it at the host log.
+  void Function(String message)? onLog;
+
+  final int Function() _nowMs;
+
+  // Size of the per-client latency window, and how far back a lease expiry
+  // still counts as a recent failure.
+  static const int _latencyWindow = 5;
+  static const int _failureWindowMs = 5 * 60 * 1000;
+
   Scheduler _scheduler;
 
   SchedulerType _schedulerType =
       SchedulerType.greedy;
 
-  DistributionManager()
-      : _scheduler =
+  /// [nowMs] is injectable so tests can drive the clock.
+  DistributionManager({
+    int Function()? nowMs,
+    this.leaseMs = 60000,
+    this.activeWindowMs = 30000,
+  })  : _nowMs = nowMs ?? _wallClockMs,
+        _scheduler =
             SchedulerFactory.create(
           SchedulerType.greedy,
         );
+
+  static int _wallClockMs() =>
+      DateTime.now().millisecondsSinceEpoch;
 
   /// Currently selected scheduling algorithm.
   SchedulerType get schedulerType =>
@@ -53,12 +87,17 @@ class DistributionManager {
   Map<String, List<Unit>> _runScheduler(
     List<Unit> available,
     int maxUnits,
+    String requesterId,
   ) {
+    // Built before the stopwatch starts: bookkeeping is not part of the
+    // algorithm's own cost.
+    final snapshot = _snapshotFor(requesterId);
+
     final sw = Stopwatch()..start();
 
     final result = _scheduler.schedule(
       available,
-      _clientEstimates,
+      snapshot,
       maxUnits,
     );
 
@@ -87,6 +126,17 @@ class DistributionManager {
     scheduleTotalUs = 0;
   }
 
+  /// Why the active scheduler decided what it did on its most recent call
+  /// (per-phone health, latency, queue depth, ...), or null when the active
+  /// algorithm does not produce a trace.
+  Map<String, dynamic>? get lastDecisionTrace {
+    final scheduler = _scheduler;
+
+    return scheduler is DynamicScheduler
+        ? scheduler.lastTrace
+        : null;
+  }
+
   // jobId -> units
   final Map<String, List<Unit>> _jobs = {};
 
@@ -97,8 +147,14 @@ class DistributionManager {
   // clientId -> estimate
   final Map<String, ClientEstimate> _clientEstimates = {};
 
+  // clientId -> live state (last seen, health, recent latency, failures)
+  final Map<String, _ClientState> _clientStates = {};
+
   // simple in-memory assignment queue per client
   final Map<String, List<Unit>> _clientQueues = {};
+
+  // jobId -> unitIndex -> who holds the unit and since when
+  final Map<String, Map<int, _Lease>> _leases = {};
 
   // Jobs that have been reset and must not issue new
   // assignments until the next experiment activates them.
@@ -140,12 +196,14 @@ class DistributionManager {
   /// This intentionally preserves:
   /// - connected clients
   /// - client performance estimates
+  /// - live client state (health, recent latency, failure history)
   /// - registered job/dataset definitions
   /// - selected scheduling algorithm
   ///
   /// It resets:
   /// - unit status
   /// - client assignment queues
+  /// - outstanding unit leases
   ///
   /// Jobs are marked inactive until the next experiment
   /// explicitly activates them.
@@ -161,6 +219,9 @@ class DistributionManager {
     for (final queue in _clientQueues.values) {
       queue.clear();
     }
+
+    // Nothing is assigned any more, so nothing can time out.
+    _leases.clear();
 
     // Prevent clients from receiving assignments until
     // the next experiment starts.
@@ -179,6 +240,14 @@ class DistributionManager {
   ) {
     _clientEstimates[clientId] = initial;
     _clientQueues[clientId] = [];
+
+    // A phone that re-registers (for example after a new warmup) keeps what
+    // the host has learned about its health and recent behaviour.
+    final state = _stateOf(clientId);
+
+    state.deviceName =
+        deviceNameFromClientId(clientId);
+    state.lastSeenMs = _nowMs();
   }
 
   List<Unit> getClientQueue(
@@ -192,6 +261,88 @@ class DistributionManager {
   /// Return registered client ids.
   List<String> get registeredClientIds =>
       _clientEstimates.keys.toList();
+
+  /// Record that the host just heard from a registered client.
+  void touchClient(String clientId) {
+    _clientStates[clientId]?.lastSeenMs =
+        _nowMs();
+  }
+
+  /// Apply a live health reading.
+  ///
+  /// [key] is either a full client id or a device key: the periodic MQTT
+  /// metrics are keyed by device IP while assignments use the full client id,
+  /// so every registered client matching either spelling is updated. An
+  /// unknown key is ignored.
+  void updateClientHealth(
+    String key,
+    DeviceHealth health,
+  ) {
+    final now = _nowMs();
+
+    for (final clientId in _clientEstimates.keys) {
+      if (clientId != key &&
+          deviceKeyFromClientId(clientId) != key) {
+        continue;
+      }
+
+      final state = _clientStates[clientId];
+
+      if (state == null) {
+        continue;
+      }
+
+      _applyHealth(state, health, now);
+      state.lastSeenMs = now;
+    }
+  }
+
+  /// Fold one finished unit into the client's state: its estimate, its recent
+  /// latency and the health it reported.
+  ///
+  /// This does not mark the unit complete; callers still use
+  /// [markUnitComplete].
+  void recordResult(ResultReport rr) {
+    touchClient(rr.clientId);
+
+    // A zero from a failed inference or an empty download, or a non-finite
+    // throughput, would drag the moving averages towards nonsense, and a phone
+    // that looks impossibly fast then wins every pick.
+    if (rr.ttprocMs > 0 &&
+        rr.bandwidthKbps > 0 &&
+        rr.bandwidthKbps.isFinite) {
+      updateClientEstimate(
+        rr.clientId,
+        rr.ttprocMs.toDouble(),
+        rr.bandwidthKbps,
+      );
+    }
+
+    final state = _clientStates[rr.clientId];
+
+    if (state == null) {
+      return;
+    }
+
+    final latencyMs = rr.totalMs > 0
+        ? rr.totalMs
+        : rr.downloadMs + rr.ttprocMs;
+
+    if (latencyMs > 0) {
+      state.latenciesMs.add(latencyMs);
+
+      if (state.latenciesMs.length >
+          _latencyWindow) {
+        state.latenciesMs.removeAt(0);
+      }
+    }
+
+    final health = rr.health;
+
+    if (health != null) {
+      _applyHealth(state, health, _nowMs());
+    }
+  }
 
   void updateClientEstimate(
     String clientId,
@@ -208,6 +359,15 @@ class DistributionManager {
         ttprocMs: ttprocMs,
         bandwidthKbps: bandwidthKbps,
       );
+
+      // A phone first seen through a result is a full participant from now
+      // on, so it needs the same bookkeeping as a registered one.
+      _clientQueues.putIfAbsent(
+        clientId,
+        () => [],
+      );
+      _stateOf(clientId);
+
       return;
     }
 
@@ -221,11 +381,126 @@ class DistributionManager {
         (1 - alpha) * prev.bandwidthKbps;
   }
 
+  _ClientState _stateOf(String clientId) {
+    return _clientStates.putIfAbsent(
+      clientId,
+      () => _ClientState(
+        deviceName:
+            deviceNameFromClientId(clientId),
+        lastSeenMs: _nowMs(),
+      ),
+    );
+  }
+
+  void _applyHealth(
+    _ClientState state,
+    DeviceHealth incoming,
+    int now,
+  ) {
+    // Fields the new reading lacks keep their old value; the empty merge only
+    // restamps updatedAtMs with the host's clock.
+    state.health = state.health
+        .merge(incoming)
+        .merge(DeviceHealth(updatedAtMs: now));
+  }
+
+  /// What the scheduler gets to see: every client heard from within
+  /// [activeWindowMs] (plus the requester, who is by definition alive), each
+  /// as a fresh copy carrying its live state, so the scheduler sees the
+  /// situation as it is right now and cannot mutate the stored estimates.
+  Map<String, ClientEstimate> _snapshotFor(
+    String? requesterId,
+  ) {
+    final now = _nowMs();
+
+    final snapshot = <String, ClientEstimate>{};
+
+    for (final entry
+        in _clientEstimates.entries) {
+      final clientId = entry.key;
+      final state = _clientStates[clientId];
+
+      if (state == null) {
+        continue;
+      }
+
+      final ageMs = now - state.lastSeenMs;
+
+      if (ageMs > activeWindowMs &&
+          clientId != requesterId) {
+        continue;
+      }
+
+      final est = entry.value.copy();
+
+      est.health = state.health;
+      est.pending =
+          _clientQueues[clientId]?.length ?? 0;
+      est.recentLatencyMs =
+          state.recentLatencyMs;
+      est.ageMs = ageMs < 0 ? 0 : ageMs;
+      est.failures = state.failuresAt(now);
+      est.deviceName = state.deviceName;
+
+      snapshot[clientId] = est;
+    }
+
+    return snapshot;
+  }
+
+  /// Per-phone account of how the host currently sees each active client
+  /// (health score, queue, latency, energy, gating) plus the raw readings, for
+  /// the host UI. Unknown readings are null.
+  Map<String, Map<String, dynamic>> clientViews({
+    int maxUnits = 2,
+  }) {
+    final snapshot = _snapshotFor(null);
+
+    final scheduler = _scheduler;
+
+    final fleet = FleetModel(
+      snapshot,
+      const [],
+      maxUnits,
+      cfg: scheduler is DynamicScheduler
+          ? scheduler.config
+          : SchedulingConfig.defaults,
+    );
+
+    final explained = fleet.explain();
+
+    final views =
+        <String, Map<String, dynamic>>{};
+
+    for (final entry in explained.entries) {
+      final est = snapshot[entry.key]!;
+      final health = est.health;
+
+      views[entry.key] = {
+        ...Map<String, dynamic>.from(
+          entry.value as Map,
+        ),
+        'age_ms': est.ageMs,
+        'device': est.deviceName,
+        'battery_pct': health.batteryPct,
+        'thermal': health.thermalStatus,
+        'rssi_dbm': health.rssiDbm,
+        'charging': health.charging,
+      };
+    }
+
+    return views;
+  }
+
   // ---------------------------------------------------------------------------
   // UNIT MANAGEMENT
   // ---------------------------------------------------------------------------
 
   /// Mark a unit as completed and update internal state.
+  ///
+  /// A result that arrives after its unit was re-queued (or even re-assigned
+  /// to another phone) is still accepted: the unit completes and leaves every
+  /// queue.
   void markUnitComplete(
     String jobId,
     int unitIndex,
@@ -239,6 +514,8 @@ class DistributionManager {
 
     statusMap[unitIndex] = 'completed';
 
+    _leases[jobId]?.remove(unitIndex);
+
     // Remove the completed unit from any client queue.
     _clientQueues.forEach(
       (_, q) {
@@ -247,6 +524,71 @@ class DistributionManager {
         );
       },
     );
+  }
+
+  /// Hand back every unit of [jobId] that has been assigned for longer than
+  /// [leaseMs] without a result, so it can go to any phone. Each reclaimed
+  /// unit leaves its holder's queue and counts as a failure for that phone.
+  ///
+  /// Returns how many units were re-queued.
+  int requeueExpired(String jobId) {
+    final leases = _leases[jobId];
+    final statusMap = _unitStatus[jobId];
+
+    if (leases == null || statusMap == null) {
+      return 0;
+    }
+
+    final now = _nowMs();
+
+    final reclaimedByClient = <String, int>{};
+
+    for (final entry in leases.entries.toList()) {
+      final unitIndex = entry.key;
+      final lease = entry.value;
+
+      if (now - lease.assignedAtMs <= leaseMs) {
+        continue;
+      }
+
+      leases.remove(unitIndex);
+
+      // Completed or reset in the meantime: nothing is stranded.
+      if (statusMap[unitIndex] != 'assigned') {
+        continue;
+      }
+
+      statusMap[unitIndex] = 'available';
+
+      _clientQueues[lease.clientId]?.removeWhere(
+        (u) => u.unitIndex == unitIndex,
+      );
+
+      _clientStates[lease.clientId]
+          ?.recordExpiry(now);
+
+      reclaimedByClient[lease.clientId] =
+          (reclaimedByClient[lease.clientId] ??
+                  0) +
+              1;
+    }
+
+    final requeued = reclaimedByClient.values
+        .fold<int>(0, (a, b) => a + b);
+
+    if (requeued > 0) {
+      final holders = reclaimedByClient.entries
+          .map((e) => '${e.key} x${e.value}')
+          .join(', ');
+
+      onLog?.call(
+        'Job $jobId: re-queued $requeued '
+        'unit(s) with no result after '
+        '${leaseMs ~/ 1000}s ($holders)',
+      );
+    }
+
+    return requeued;
   }
 
   // ---------------------------------------------------------------------------
@@ -259,6 +601,9 @@ class DistributionManager {
   ///
   /// If the job has been reset and has not yet been activated
   /// for a new experiment, no assignments are returned.
+  ///
+  /// Units whose lease has expired are re-queued first, so a phone that went
+  /// quiet does not hold them back from the phone that is asking now.
   List<Unit> assignNext(
     String jobId,
     String clientId, {
@@ -275,11 +620,21 @@ class DistributionManager {
       return [];
     }
 
+    requeueExpired(jobId);
+
+    final queue = _clientQueues[clientId];
+
+    // An unregistered requester has no state to schedule against.
+    if (queue == null) {
+      return [];
+    }
+
+    final statusMap = _unitStatus[jobId]!;
+
     final available = units
         .where(
           (u) =>
-              _unitStatus[jobId]![
-                  u.unitIndex] ==
+              statusMap[u.unitIndex] ==
               'available',
         )
         .toList();
@@ -288,17 +643,40 @@ class DistributionManager {
       return [];
     }
 
-    final assignments =
-        _runScheduler(available, maxUnits);
+    final assignments = _runScheduler(
+      available,
+      maxUnits,
+      clientId,
+    );
 
-    final assignedForClient =
+    final proposed =
         assignments[clientId] ?? [];
 
-    for (final u in assignedForClient) {
-      _unitStatus[jobId]![u.unitIndex] =
-          'assigned';
+    final now = _nowMs();
 
-      _clientQueues[clientId]!.add(u);
+    final assignedForClient = <Unit>[];
+
+    for (final u in proposed) {
+      // A unit is only ever given out while it is available, whatever a
+      // pluggable scheduler returns, so it can never sit with two phones.
+      if (statusMap[u.unitIndex] !=
+          'available') {
+        continue;
+      }
+
+      statusMap[u.unitIndex] = 'assigned';
+
+      queue.add(u);
+
+      final leases = _leases.putIfAbsent(
+        jobId,
+        () => {},
+      );
+
+      leases[u.unitIndex] =
+          _Lease(clientId, now);
+
+      assignedForClient.add(u);
     }
 
     return assignedForClient;
@@ -326,6 +704,10 @@ class DistributionManager {
       return [];
     }
 
+    if (!_clientEstimates.containsKey(clientId)) {
+      return [];
+    }
+
     final available = units
         .where(
           (u) =>
@@ -339,8 +721,11 @@ class DistributionManager {
       return [];
     }
 
-    final assignments =
-        _runScheduler(available, maxUnits);
+    final assignments = _runScheduler(
+      available,
+      maxUnits,
+      clientId,
+    );
 
     final assignedForClient =
         assignments[clientId] ?? [];
@@ -428,5 +813,62 @@ class DistributionManager {
     } catch (_) {
       return null;
     }
+  }
+}
+
+/// A unit handed to a client and not yet reported back.
+class _Lease {
+  final String clientId;
+  final int assignedAtMs;
+
+  _Lease(this.clientId, this.assignedAtMs);
+}
+
+/// What the host has observed about one client, beyond its speed estimates.
+class _ClientState {
+  String deviceName;
+  int lastSeenMs;
+  DeviceHealth health = DeviceHealth.unknown;
+
+  /// Total ms (download + inference) of the last few finished units.
+  final List<int> latenciesMs = [];
+
+  /// When this client's leases expired, oldest first.
+  final List<int> _expiriesMs = [];
+
+  _ClientState({
+    required this.deviceName,
+    required this.lastSeenMs,
+  });
+
+  /// Mean of the latency window; 0 until a unit has finished.
+  double get recentLatencyMs =>
+      latenciesMs.isEmpty
+          ? 0
+          : latenciesMs.fold<int>(
+                0,
+                (a, b) => a + b,
+              ) /
+              latenciesMs.length;
+
+  void recordExpiry(int now) {
+    _expiriesMs.removeWhere(
+      (t) =>
+          now - t >
+          DistributionManager._failureWindowMs,
+    );
+    _expiriesMs.add(now);
+  }
+
+  /// Lease expiries within the recent failure window.
+  int failuresAt(int now) {
+    return _expiriesMs
+        .where(
+          (t) =>
+              now - t <=
+              DistributionManager
+                  ._failureWindowMs,
+        )
+        .length;
   }
 }

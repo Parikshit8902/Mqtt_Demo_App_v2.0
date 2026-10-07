@@ -45,6 +45,13 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 - Pick the scheduling algorithm in the metrics screen (broker phone), or `curl -X POST http://<broker-ip>:8080/admin/scheduler -d '{"id":"round_robin"}'`. New algorithms are registered in `lib/services/schedulers/scheduler_registry.dart`.
 - Power is an estimate; see `PROPOSAL.md` for what is measured, what is modelled, and the iOS limits.
 
+## Dynamic scheduling (Greedy, PSO, MOMPSO, MOMPSO-GA)
+All four schedulers now decide from live data instead of two static numbers. The host sees, per worker: CPU load, free RAM, battery and charging, thermal status, Wi-Fi signal (Android), measured bandwidth and inference time, queue depth, recent latency and a power class by device model. Workers report health every 5 s over MQTT and with every finished unit.
+- **Shared model** (`lib/services/schedulers/scheduling_model.dart`): the health score is the DetectNet `hScore` formula driven by live values; thermal, battery, memory, Wi-Fi signal and recent timeouts derate a phone's capacity; phones at <=5% battery (unplugged), critical thermal state, low memory or repeated timeouts get no new work (unless every phone is in that state); each assignment lengthens that phone's queue, which spreads a batch.
+- **Algorithms** keep the structure of the `Parikshit` versions and DetectNet: Greedy = earliest estimated finish; PSO = lightweight swarm over health scores; MOMPSO = weighted health / latency / queue / energy; MOMPSO-GA = MOMPSO plus 70/30 blend and mutation. Default MOMPSO weights are the DetectNet ones scaled by 0.8 with 0.2 for energy (`ObjectiveWeights`).
+- **Robustness:** units not finished within 60 s are requeued; silent phones are dropped from planning; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
+- **Limits:** PSO and MOMPSO-GA are DetectNet's heuristics (PSO's fitness reduces to ranking by health; GA's closest-to-blend pick selects the top mutated score), not literature-faithful multi-objective PSO/GA. The thresholds in `HealthPolicy` are heuristics to calibrate. CPU load is the app's own process CPU. The Android Kotlin additions could not be compiled in the authoring environment.
+
 ## Basic troubleshooting (non-technical)
 - If you can't connect, make sure both devices are on the same Wi‑Fi network.
 - Check the IP address shown on the broker device and enter it exactly on the client device.
