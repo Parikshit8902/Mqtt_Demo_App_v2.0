@@ -5,9 +5,15 @@ import '../models/result_dto.dart';
 
 class GreedyScheduler implements Scheduler {
   @override
+  String get id => 'greedy';
+  @override
+  String get label => 'Greedy (earliest finish)';
+
+  @override
   Map<String, List<Unit>> schedule(List<Unit> availableUnits, Map<String, ClientEstimate> clients, int maxUnitPerAssign) {
     // Simple greedy: assign units one-by-one to the client with smallest estimated finish time
     final assignments = <String, List<Unit>>{};
+    if (clients.isEmpty) return assignments;
 
     // Make a mutable copy of availableUnits
     final units = List<Unit>.from(availableUnits);

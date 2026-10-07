@@ -14,6 +14,9 @@ import 'distribution_singleton.dart';
 import 'models/result_dto.dart';
 import 'models/assignment.dart';
 import 'network_helper.dart';
+import 'metrics/metrics_store.dart';
+import 'metrics/traffic_counter.dart';
+import 'schedulers/scheduler_registry.dart';
 
 /// Manages the HTTP file server for sharing files between devices.
 ///
@@ -175,6 +178,35 @@ class FileServerService {
         _handleDownloadMetrics,
       );
 
+      // Per-phone metrics: workers upload their full recording; anyone on the
+      // LAN can pull the combined results (open
+      // http://<host-ip>:8080/admin/metrics.csv in a browser).
+      router.post(
+        '/admin/metrics_report',
+        _handleMetricsReport,
+      );
+
+      router.get(
+        '/admin/metrics.json',
+        _handleMetricsJson,
+      );
+
+      router.get(
+        '/admin/metrics.csv',
+        _handleMetricsCsv,
+      );
+
+      // Scheduling algorithm selection (also settable from the host UI).
+      router.get(
+        '/admin/scheduler',
+        _handleGetScheduler,
+      );
+
+      router.post(
+        '/admin/scheduler',
+        _handleSetScheduler,
+      );
+
       // -----------------------------------------------------------------------
       // DISTRIBUTED JOB ENDPOINTS
       // -----------------------------------------------------------------------
@@ -200,8 +232,11 @@ class FileServerService {
 
       final logMiddleware = shelf.logRequests();
 
+      MetricsStore.instance.schedulerId = distributionManager.schedulerId;
+
       final handler = shelf.Pipeline()
           .addMiddleware(logMiddleware)
+          .addMiddleware(_trafficMiddleware())
           .addHandler(router.call);
 
       _logger.log(
@@ -1234,6 +1269,7 @@ class FileServerService {
       // Clear experiment-specific server state.
       _schedulerLogs.clear();
       _resultReportsByJob.clear();
+      MetricsStore.instance.clear();
 
       _logger.log(
         '✅ Experiment state reset successfully',
@@ -2086,8 +2122,26 @@ class FileServerService {
         '✅ Result received for job '
         '${rr.jobId} unit ${rr.unitIndex} '
         'from ${rr.clientId} '
-        '(tt=${rr.ttprocMs}ms '
-        'bw=${rr.bandwidthKbps}kB/s)',
+        '(infer=${rr.ttprocMs}ms '
+        'download=${rr.downloadMs}ms '
+        'bw=${rr.bandwidthKbps.toStringAsFixed(1)}kB/s)',
+      );
+
+      final deviceKey = deviceKeyFromClientId(rr.clientId);
+      MetricsStore.instance.recordUnit(
+        deviceKey,
+        UnitRecord(
+          deviceKey: deviceKey,
+          jobId: jobId,
+          unitIndex: rr.unitIndex,
+          bytes: rr.bytes,
+          downloadMs: rr.downloadMs,
+          inferMs: rr.ttprocMs,
+          totalMs: rr.totalMs,
+          downloadKBps: rr.bandwidthKbps,
+          scheduler: distributionManager.schedulerId,
+          t: DateTime.now().millisecondsSinceEpoch,
+        ),
       );
 
       // Produce a quick scheduler summary
@@ -2183,6 +2237,108 @@ class FileServerService {
       return shelf.Response.internalServerError(
         body: 'error',
       );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // PER-PHONE METRICS + SCHEDULER SELECTION
+  // ---------------------------------------------------------------------------
+
+  /// Counts every HTTP body byte this phone serves/receives, per peer, so the
+  /// host's own network load can be attributed to each worker.
+  shelf.Middleware _trafficMiddleware() {
+    return (shelf.Handler inner) {
+      return (shelf.Request request) async {
+        final channel = request.url.path.startsWith('files') ? TrafficChannel.httpData : TrafficChannel.httpControl;
+        final info = request.context['shelf.io.connection_info'];
+        final peer = info is HttpConnectionInfo ? info.remoteAddress.address : null;
+        final counted = request.change(
+          body: request.read().map((chunk) {
+            TrafficCounter.instance.addRx(channel, chunk.length, peer: peer);
+            return chunk;
+          }),
+        );
+        final response = await inner(counted);
+        return response.change(
+          body: response.read().map((chunk) {
+            TrafficCounter.instance.addTx(channel, chunk.length, peer: peer);
+            return chunk;
+          }),
+        );
+      };
+    };
+  }
+
+  /// A worker uploads its full recording (samples, per-unit records, traffic).
+  Future<shelf.Response> _handleMetricsReport(shelf.Request request) async {
+    try {
+      final j = jsonDecode(await request.readAsString());
+      if (j is! Map<String, dynamic>) return shelf.Response(400, body: 'expected object');
+      MetricsStore.instance.mergeDeviceReport(j);
+      _logger.log('📊 Metrics report received from ${j['name']} (${j['key']})');
+      return shelf.Response.ok(jsonEncode({'status': 'ok'}), headers: {'Content-Type': 'application/json'});
+    } catch (e) {
+      _logger.log('❌ Error processing metrics report: $e');
+      return shelf.Response.internalServerError(body: 'error');
+    }
+  }
+
+  Future<shelf.Response> _handleMetricsJson(shelf.Request request) async {
+    final device = request.url.queryParameters['device'];
+    return shelf.Response.ok(
+      jsonEncode(MetricsStore.instance.toJson(deviceKey: device)),
+      headers: {'Content-Type': 'application/json'},
+    );
+  }
+
+  /// kind = summary (default) | samples | units; optional device=<ip>.
+  Future<shelf.Response> _handleMetricsCsv(shelf.Request request) async {
+    final store = MetricsStore.instance;
+    final device = request.url.queryParameters['device'];
+    final kind = request.url.queryParameters['kind'] ?? 'summary';
+    final String csv;
+    switch (kind) {
+      case 'samples':
+        csv = store.samplesCsv(deviceKey: device);
+        break;
+      case 'units':
+        csv = store.unitsCsv(deviceKey: device);
+        break;
+      default:
+        csv = store.summaryCsv(deviceKey: device);
+    }
+    return shelf.Response.ok(csv, headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="metrics_$kind.csv"',
+    });
+  }
+
+  Future<shelf.Response> _handleGetScheduler(shelf.Request request) async {
+    return shelf.Response.ok(
+      jsonEncode({
+        'active': distributionManager.schedulerId,
+        'available': [for (final id in SchedulerRegistry.ids) {'id': id, 'label': SchedulerRegistry.labelFor(id)}],
+        'schedule_calls': distributionManager.scheduleCalls,
+        'avg_schedule_ms': distributionManager.avgScheduleMs,
+      }),
+      headers: {'Content-Type': 'application/json'},
+    );
+  }
+
+  /// Body: {"id": "round_robin"}
+  Future<shelf.Response> _handleSetScheduler(shelf.Request request) async {
+    try {
+      final j = jsonDecode(await request.readAsString()) as Map<String, dynamic>;
+      final id = j['id'] as String? ?? '';
+      if (!SchedulerRegistry.contains(id)) {
+        return shelf.Response(400, body: 'unknown scheduler: $id (available: ${SchedulerRegistry.ids.join(', ')})');
+      }
+      distributionManager.setScheduler(id);
+      MetricsStore.instance.schedulerId = id;
+      _logger.log('🧭 Scheduler set to $id');
+      return shelf.Response.ok(jsonEncode({'status': 'ok', 'active': id}), headers: {'Content-Type': 'application/json'});
+    } catch (e) {
+      return shelf.Response(400, body: 'bad request: $e');
     }
   }
 

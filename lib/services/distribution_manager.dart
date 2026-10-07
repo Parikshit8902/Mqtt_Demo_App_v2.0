@@ -3,6 +3,7 @@ import 'models/result_dto.dart';
 import 'schedulers/scheduler.dart';
 import 'schedulers/scheduler_type.dart';
 import 'schedulers/scheduler_factory.dart';
+import 'schedulers/scheduler_registry.dart';
 
 class DistributionManager {
   Scheduler _scheduler;
@@ -24,6 +25,50 @@ class DistributionManager {
   String get schedulerName =>
       _schedulerType.displayName;
 
+  /// Stable id of the active algorithm (used in logs, exports and REST).
+  String get schedulerId =>
+      _schedulerType.id;
+
+  /// Select an algorithm by id (see [SchedulerRegistry]).
+  void setScheduler(String id) {
+    final type = SchedulerTypeExtension.tryFromId(id);
+
+    if (type == null) {
+      throw ArgumentError('Unknown scheduler: $id');
+    }
+
+    setSchedulerType(type);
+  }
+
+  /// Cost of the scheduling decision itself. It matters on a phone host:
+  /// a PSO run is far heavier than greedy.
+  int scheduleCalls = 0;
+  int scheduleTotalUs = 0;
+
+  double get avgScheduleMs =>
+      scheduleCalls == 0
+          ? 0
+          : scheduleTotalUs / scheduleCalls / 1000.0;
+
+  Map<String, List<Unit>> _runScheduler(
+    List<Unit> available,
+    int maxUnits,
+  ) {
+    final sw = Stopwatch()..start();
+
+    final result = _scheduler.schedule(
+      available,
+      _clientEstimates,
+      maxUnits,
+    );
+
+    sw.stop();
+    scheduleCalls++;
+    scheduleTotalUs += sw.elapsedMicroseconds;
+
+    return result;
+  }
+
   /// Change the scheduling algorithm.
   ///
   /// This affects new assignments only.
@@ -38,6 +83,8 @@ class DistributionManager {
 
     _schedulerType = type;
     _scheduler = SchedulerFactory.create(type);
+    scheduleCalls = 0;
+    scheduleTotalUs = 0;
   }
 
   // jobId -> units
@@ -242,11 +289,7 @@ class DistributionManager {
     }
 
     final assignments =
-        _scheduler.schedule(
-      available,
-      _clientEstimates,
-      maxUnits,
-    );
+        _runScheduler(available, maxUnits);
 
     final assignedForClient =
         assignments[clientId] ?? [];
@@ -297,11 +340,7 @@ class DistributionManager {
     }
 
     final assignments =
-        _scheduler.schedule(
-      available,
-      _clientEstimates,
-      maxUnits,
-    );
+        _runScheduler(available, maxUnits);
 
     final assignedForClient =
         assignments[clientId] ?? [];

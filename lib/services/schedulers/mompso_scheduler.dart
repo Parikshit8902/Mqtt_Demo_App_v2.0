@@ -5,6 +5,11 @@ import 'scheduler_utils.dart';
 
 class MOMPSOScheduler implements Scheduler {
   @override
+  String get id => 'mompso';
+  @override
+  String get label => 'MOMPSO';
+
+  @override
   Map<String, List<Unit>> schedule(
     List<Unit> availableUnits,
     Map<String, ClientEstimate> clients,

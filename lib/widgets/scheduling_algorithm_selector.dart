@@ -25,6 +25,7 @@ class SchedulingAlgorithmSelector
             'Select Scheduling Algorithm',
           ),
           children: SchedulerType.values
+              .where((t) => !t.isBaseline)
               .map(
                 (type) => SimpleDialogOption(
                   onPressed: () {

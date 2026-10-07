@@ -6,6 +6,11 @@ import 'scheduler.dart';
 import 'scheduler_utils.dart';
 
 class MOMPSOGAScheduler implements Scheduler {
+  @override
+  String get id => 'mompso-ga';
+  @override
+  String get label => 'MOMPSO-GA';
+
   final Random _random = Random();
 
   @override

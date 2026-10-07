@@ -37,6 +37,14 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 - The app also includes a screen that can download a small machine learning model and a sample dataset and run local tests (this is optional).
 - This screen is mainly for testing and learning how models perform on the device; you can also export detection results if you try it.
 
+## Metrics, export and scheduling (for experiments)
+- Open **Analytics → chart icon** to see per-phone CPU, memory, network, power, battery and per-image timings, plus how much data was real payload versus protocol overhead.
+- **Export** writes `summary.csv`, `samples.csv`, `units.csv` and `full.json`. On the broker phone it covers every phone; on a worker it covers that phone. Android: `Android/data/com.example.mqtt_demo/files/metrics_exports`; iOS: the app's folder in the Files app.
+- Workers send their full recording to the broker phone automatically when their work runs dry (or press **Send report to host**).
+- From a laptop on the same Wi-Fi: `http://<broker-ip>:8080/admin/metrics.csv?kind=summary|samples|units` (optionally `&device=<phone-ip>`), or `/admin/metrics.json` for JSON (`/admin/metrics` is the plain-text experiment report with its Download button).
+- Pick the scheduling algorithm in the metrics screen (broker phone), or `curl -X POST http://<broker-ip>:8080/admin/scheduler -d '{"id":"round_robin"}'`. New algorithms are registered in `lib/services/schedulers/scheduler_registry.dart`.
+- Power is an estimate; see `PROPOSAL.md` for what is measured, what is modelled, and the iOS limits.
+
 ## Basic troubleshooting (non-technical)
 - If you can't connect, make sure both devices are on the same Wi‑Fi network.
 - Check the IP address shown on the broker device and enter it exactly on the client device.

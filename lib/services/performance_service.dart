@@ -1,7 +1,11 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart'; // Import for WidgetsBindingObserver
+import 'metrics/metrics_store.dart';
+import 'metrics/power_model.dart';
+import 'metrics/traffic_counter.dart';
 
 // Use the same channel name as defined in MainActivity.kt
 const platform = MethodChannel('com.example.mqtt_demo/performance');
@@ -14,6 +18,10 @@ class PerformanceData {
   final String diskUsage;
   final String batteryLevel;
   final List<double> cpuDataPoints;
+  /// Whole-device draw from battery current x voltage (Android, unplugged), mW. Null if unavailable.
+  final double? measuredPowerMw;
+  /// Modelled draw of this app only, mW.
+  final double modelPowerMw;
 
   PerformanceData({
     this.cpuUsage = 0.0,
@@ -22,6 +30,8 @@ class PerformanceData {
     this.diskUsage = '...',
     this.batteryLevel = '...',
     this.cpuDataPoints = const [],
+    this.measuredPowerMw,
+    this.modelPowerMw = 0.0,
   });
 }
 
@@ -123,6 +133,7 @@ class PerformanceService with WidgetsBindingObserver {
       final currentMetrics = results[0] as Map<String, int>;
       final currentMemory = results[1] as double;
       final currentBattery = results[2] as int;
+      final measuredPowerMw = await _readMeasuredPowerMw();
       final now = DateTime.now();
       
       final deltaSeconds = now.difference(_lastTimestamp).inMilliseconds > 0 
@@ -130,6 +141,7 @@ class PerformanceService with WidgetsBindingObserver {
           : 1.0;
 
       double cpuUsage = notifier.value.cpuUsage; // Default to old value
+      final hadPrevious = _lastMetrics.isNotEmpty;
       if (_lastMetrics.containsKey('cpuJiffies') && currentMetrics.containsKey('cpuJiffies')) {
         final cpuJiffiesDiff = currentMetrics['cpuJiffies']! - _lastMetrics['cpuJiffies']!;
         
@@ -146,10 +158,14 @@ class PerformanceService with WidgetsBindingObserver {
       }
 
       String networkUsage = notifier.value.networkUsage; // Default to old value
+      double rxKBps = 0, txKBps = 0;
       if (_lastMetrics.containsKey('netRxBytes') && currentMetrics.containsKey('netRxBytes')) {
-        final rxDiff = currentMetrics['netRxBytes']! - _lastMetrics['netRxBytes']!;
-        final txDiff = currentMetrics['netTxBytes']! - _lastMetrics['netTxBytes']!;
-        final totalSpeed = ((rxDiff + txDiff) / deltaSeconds) / 1024;
+        // TrafficStats reports -1 when unsupported; ignore those readings.
+        final rxDiff = currentMetrics['netRxBytes']! >= 0 ? currentMetrics['netRxBytes']! - _lastMetrics['netRxBytes']! : 0;
+        final txDiff = currentMetrics['netTxBytes']! >= 0 ? currentMetrics['netTxBytes']! - _lastMetrics['netTxBytes']! : 0;
+        rxKBps = (rxDiff / deltaSeconds) / 1024;
+        txKBps = (txDiff / deltaSeconds) / 1024;
+        final totalSpeed = rxKBps + txKBps;
         networkUsage = '${totalSpeed.toStringAsFixed(1)} KB/s';
       }
 
@@ -164,6 +180,30 @@ class PerformanceService with WidgetsBindingObserver {
       _lastMetrics = currentMetrics;
       _lastTimestamp = now;
 
+      final cores = Platform.numberOfProcessors > 0 ? Platform.numberOfProcessors : 1;
+      final modelMw = _powerModel.estimateMw(
+        cpuCores: cpuUsage / 100.0,
+        bytesPerSec: (rxKBps + txKBps) * 1024,
+      );
+
+      // Record a sample for the metrics pipeline (needs a previous reading for rates).
+      if (hadPrevious) {
+        MetricsStore.instance.recordLocal(MetricSample(
+          t: now.millisecondsSinceEpoch,
+          cpuPct: cpuUsage,
+          cpuNormPct: cpuUsage / cores,
+          memMb: currentMemory,
+          rxKBps: rxKBps,
+          txKBps: txKBps,
+          rxBytes: currentMetrics['netRxBytes'] ?? 0,
+          txBytes: currentMetrics['netTxBytes'] ?? 0,
+          payloadBytes: TrafficCounter.instance.totalPayload,
+          battery: currentBattery,
+          measuredMw: measuredPowerMw,
+          modelMw: modelMw,
+        ));
+      }
+
       // Update the notifier with a new data object containing all metrics.
       notifier.value = PerformanceData(
         cpuUsage: cpuUsage,
@@ -172,12 +212,37 @@ class PerformanceService with WidgetsBindingObserver {
         diskUsage: diskUsage,
         batteryLevel: '$currentBattery%',
         cpuDataPoints: List.from(_cpuDataPoints),
+        measuredPowerMw: measuredPowerMw,
+        modelPowerMw: modelMw,
       );
 
     } catch (e) {
       print("Failed to fetch performance metrics: $e");
     }
   }
+
+  /// Whole-device power from battery current x voltage. Only meaningful while
+  /// unplugged, and only where the OS exposes the current (Android). Returns
+  /// null otherwise. This is the *device*, not just this app - use it to
+  /// calibrate [PowerModel] rather than to attribute power to the app.
+  Future<double?> _readMeasuredPowerMw() async {
+    try {
+      final p = await platform.invokeMapMethod<String, dynamic>('getPowerDetails');
+      if (p == null || p['charging'] == true) return null;
+      final currentRaw = (p['currentNow'] as num?)?.toDouble();
+      final voltageMv = (p['voltageMv'] as num?)?.toDouble();
+      if (currentRaw == null || voltageMv == null || currentRaw == 0 || voltageMv <= 0) return null;
+      // BATTERY_PROPERTY_CURRENT_NOW is specified in microamps, but some vendors
+      // report milliamps. Real phone draw is >= tens of mA, so a magnitude under
+      // 20000 can only be mA.
+      final mA = currentRaw.abs() < 20000 ? currentRaw.abs() : currentRaw.abs() / 1000.0;
+      return mA * (voltageMv / 1000.0);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  final PowerModel _powerModel = PowerModel.defaults;
 
   void dispose() {
     // Unregister the observer to prevent memory leaks when the service is no longer needed.

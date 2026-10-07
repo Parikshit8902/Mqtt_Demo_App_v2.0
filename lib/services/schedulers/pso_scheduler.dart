@@ -6,6 +6,11 @@ import 'scheduler.dart';
 import 'scheduler_utils.dart';
 
 class PSOScheduler implements Scheduler {
+  @override
+  String get id => 'pso';
+  @override
+  String get label => 'PSO';
+
   final Random _random = Random();
 
   @override
