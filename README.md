@@ -23,7 +23,8 @@ These two modes let you test sending and receiving messages between multiple dev
 3. On Device B (a client):
   - Tap "Become MQTT Client".
   - Use the automatic search (magnifier icon) to find the broker shown by Device A, or type that IP address into the broker field.
-  - Type the 6-digit session PIN shown on Device A (every hosted session gets a new one), then pick the session.
+  - Easiest: tap **Scan the host's QR code** and point the camera at the code on Device A's session screen (it carries the address and PIN).
+  - Or type the 6-digit session PIN shown on Device A (every hosted session gets a new one), then pick the session.
   - Tap "Connect" and then tap "Subscribe" to start receiving messages.
 4. On Device B, tap "Publish Message" to send a test message — both devices should show the message in the log.
 
@@ -57,8 +58,8 @@ All four schedulers now decide from live data instead of two static numbers. The
 - **Shared model** (`lib/services/schedulers/scheduling_model.dart`): the health score is the DetectNet `hScore` formula driven by live values; thermal, battery, memory, Wi-Fi signal and recently failed units derate a phone's capacity; phones at <=5% battery (unplugged), critical thermal state, low memory or repeatedly failed units (timeouts or reported errors) get no new work (unless every phone is in that state); each assignment lengthens that phone's queue, which spreads a batch.
 - **Algorithms** keep the structure of the `Parikshit` versions and DetectNet: Greedy = earliest estimated finish; PSO = lightweight swarm over health scores; MOMPSO = weighted health / latency / queue / energy; MOMPSO-GA = MOMPSO plus 70/30 blend and mutation. Default MOMPSO weights are the DetectNet ones scaled by 0.8 with 0.2 for energy (`ObjectiveWeights`).
 - **Batch size:** each request gets a fixed number of units (Units per assignment). With **Adaptive batch size** on, a request gets about the units still left divided by twice the number of active phones, capped by Units per assignment: large batches early, single units near the end. Also settable with `POST /admin/job_options {"job_id": ..., "adaptive_batch": true}`.
-- **Robustness:** units not finished within 60 s are requeued; a worker whose download or inference fails reports it and the unit is requeued at once (a failure is never counted as a finished image), and a unit that fails 3 times is skipped so the job can finish; silent phones are dropped from planning; a shared dataset ZIP is extracted once and images are served from disk; idle workers poll every 2 s doubling to 16 s, and the host wakes them on the `work/available` MQTT topic when work appears; while a phone hosts or works, its screen stays on and metrics keep sampling; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
-- **Limits:** PSO and MOMPSO-GA are DetectNet's heuristics (PSO's fitness reduces to ranking by health; GA's closest-to-blend pick selects the top mutated score), not literature-faithful multi-objective PSO/GA. The thresholds in `HealthPolicy` are heuristics to calibrate. CPU load is the app's own process CPU. The Android Kotlin additions could not be compiled in the authoring environment.
+- **Robustness:** units not finished within 60 s are requeued; a worker whose download or inference fails reports it and the unit is requeued at once (a failure is never counted as a finished image), and a unit that fails 3 times is skipped so the job can finish; silent phones are dropped from planning; a shared dataset ZIP is extracted once and images are served from disk; idle workers poll every 2 s doubling to 16 s, and the host wakes them on the `work/available` MQTT topic when work appears; while a phone hosts or works, its screen stays on, metrics keep sampling, and on Android a foreground service (with a notification) plus CPU and Wi-Fi locks keep the run going if the screen turns off or the app is sent to the background; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
+- **Limits:** PSO and MOMPSO-GA are DetectNet's heuristics (PSO's fitness reduces to ranking by health; GA's closest-to-blend pick selects the top mutated score), not literature-faithful multi-objective PSO/GA. The thresholds in `HealthPolicy` are heuristics to calibrate. CPU load is the app's own process CPU. The Android code now builds (`flutter build apk --debug`) but has not been tested on a device here.
 
 ## Basic troubleshooting (non-technical)
 - If you can't connect, make sure both devices are on the same Wi‑Fi network.
@@ -81,7 +82,7 @@ If you are curious or want to run the project from source, here are a few short 
 - To run from source:
   1. Install Flutter and set up your platform (Android or iOS).
   2. In the project folder run: `flutter pub get` then `flutter run`.
-- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request.
+- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request, and builds a debug APK so the Android code is compiled too (`flutter build apk --debug` needs a Java 17 JDK).
 
 If you'd like, we can add back a full developer section with dependency versions and code structure.
 

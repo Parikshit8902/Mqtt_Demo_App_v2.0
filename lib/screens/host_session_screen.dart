@@ -4,8 +4,10 @@ import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:qr_flutter/qr_flutter.dart';
 import 'results_gallery_screen.dart';
 import '../services/mqtt_service.dart';
+import '../services/session_link.dart';
 import '../widgets/message_log.dart';
 import '../widgets/file_share_widget.dart';
 import '../services/topic_manager.dart';
@@ -1937,13 +1939,32 @@ class _HostSessionScreenState
                                     ),
                                   ),
                                   Text(
-                                    'Participants enter this PIN to join',
+                                    'Participants scan this code, or enter this PIN, to join',
                                     style: TextStyle(
                                       color: Colors
                                           .grey.shade600,
                                       fontSize: 12,
                                     ),
                                   ),
+                                  if (widget.mqttService
+                                      .hostLanIp
+                                      .isNotEmpty) ...[
+                                    const SizedBox(
+                                      height: 8,
+                                    ),
+                                    QrImageView(
+                                      data: SessionLink(
+                                        widget.mqttService
+                                            .hostLanIp,
+                                        pin: widget
+                                            .mqttService
+                                            .sessionPin,
+                                      ).encode(),
+                                      size: 150,
+                                      backgroundColor:
+                                          Colors.white,
+                                    ),
+                                  ],
                                 ],
                               ],
                             )

@@ -514,6 +514,22 @@ class MainActivity: FlutterActivity() {
                     result.success(null)
                 }
 
+                // Keeps an experiment running with the screen off (see RunService).
+                // Starting can be refused when the app is not in the foreground.
+                "startRunService" -> {
+                    try {
+                        RunService.start(this, call.argument<String>("text") ?: "Experiment running")
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+
+                "stopRunService" -> {
+                    RunService.stop(this)
+                    result.success(null)
+                }
+
                 "getBatteryDetails" -> {
                     val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                     val batteryStatus: Intent? = context.registerReceiver(null, iFilter)

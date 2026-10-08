@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import '../services/mqtt_service.dart';
 import '../services/network_helper.dart';
 import '../services/broker_discovery_service.dart';
+import '../services/session_link.dart';
+import 'scan_session_screen.dart';
 import '../widgets/broker_selection_widget.dart';
 import '../widgets/message_log.dart';
 import '../widgets/file_download_widget.dart';
@@ -111,6 +113,18 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
         const SnackBar(content: Text('Failed to connect to session. Check the PIN shown on the host and that both phones are on the same Wi-Fi.')),
       );
     }
+  }
+
+  /// Join by scanning the QR code on the host's session screen: it carries
+  /// the host's address and the session PIN.
+  Future<void> _scanQr() async {
+    final link = await Navigator.of(context).push<SessionLink>(
+      MaterialPageRoute(builder: (_) => const ScanSessionScreen()),
+    );
+    if (link == null || !mounted) return;
+    _brokerIpController.text = link.host;
+    if (link.pin != null) _pinController.text = link.pin!;
+    await _connect(link.host);
   }
 
   Future<void> _disconnect() async {
@@ -244,6 +258,12 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
                   Text(
                     'Available Sessions',
                     style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 16),
+                  OutlinedButton.icon(
+                    onPressed: _scanQr,
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: const Text('Scan the host\'s QR code'),
                   ),
                   const SizedBox(height: 16),
                   BrokerSelectionWidget(

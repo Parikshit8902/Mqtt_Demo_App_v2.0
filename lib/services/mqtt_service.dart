@@ -666,6 +666,9 @@ class MqttService extends ChangeNotifier {
   
   /// Get server URL for file sharing
   String get serverUrl => _fileServerService.networkServerUrl;
+
+  /// Host only: this phone's address on the Wi-Fi, which other phones join.
+  String get hostLanIp => _fileServerService.networkAccessibleIp;
   
   /// Process incoming file share message - deprecated but kept for compatibility
   Future<FileDownloadTask?> processFileShareMessage(String message) async {

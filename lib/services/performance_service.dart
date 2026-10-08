@@ -98,11 +98,14 @@ class PerformanceService with WidgetsBindingObserver {
   bool get runActive => _runHolders.isNotEmpty;
 
   /// Keep sampling, and keep the screen on, until [endRun] with the same [who].
+  /// On Android a foreground service also keeps the run going if the screen
+  /// turns off or the app goes to the background anyway.
   void beginRun(String who) {
     final first = _runHolders.isEmpty;
     _runHolders.add(who);
     if (first) {
       _setKeepScreenOn(true);
+      _setRunService(true);
       _startTimer();
     }
   }
@@ -110,6 +113,19 @@ class PerformanceService with WidgetsBindingObserver {
   void endRun(String who) {
     if (_runHolders.remove(who) && _runHolders.isEmpty) {
       _setKeepScreenOn(false);
+      _setRunService(false);
+    }
+  }
+
+  Future<void> _setRunService(bool on) async {
+    try {
+      if (on) {
+        await platform.invokeMethod('startRunService', {'text': 'Hosting or working on an experiment'});
+      } else {
+        await platform.invokeMethod('stopRunService');
+      }
+    } catch (_) {
+      // iOS has no such service (it suspends backgrounded apps regardless).
     }
   }
 
