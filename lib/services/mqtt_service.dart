@@ -20,6 +20,7 @@ import 'performance_service.dart';
 import 'session_auth.dart';
 import 'device_info_helper.dart';
 import 'distribution_singleton.dart';
+import 'fault_injector.dart';
 import 'metrics/metrics_store.dart';
 import 'metrics/traffic_counter.dart';
 import 'models/device_health.dart';
@@ -74,6 +75,12 @@ class MqttService extends ChangeNotifier {
     addMessageListener('clients/metrics', _feedSchedulerHealth);
   }
 
+  /// Host only: the job the shared dataset is registered under.
+  String get currentJobId => _fileServerService.currentJobId;
+
+  /// Host only: clear the current experiment (see FileServerService).
+  void resetExperiment() => _fileServerService.resetExperiment();
+
   /// Topic on which the host tells idle workers that a job has units to hand
   /// out, so they ask now instead of waiting out their polling backoff.
   static const String workAvailableTopic = 'work/available';
@@ -94,6 +101,8 @@ class MqttService extends ChangeNotifier {
       if (j is! Map<String, dynamic>) return;
       final key = j['i'];
       if (key is! String || key.isEmpty) return;
+      // A phone dropped by fault injection must look silent to the scheduler.
+      if (FaultInjector.instance.isDropped(key)) return;
       distributionManager.updateClientHealth(
         key,
         DeviceHealth.fromWire(j, updatedAtMs: DateTime.now().millisecondsSinceEpoch),

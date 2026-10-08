@@ -46,6 +46,9 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 - Pick the scheduling algorithm in the metrics screen (broker phone), or `curl -X POST http://<broker-ip>:8080/admin/scheduler -d '{"id":"round_robin"}'`. New algorithms are registered in `lib/services/schedulers/scheduler_registry.dart`.
 - Power is an estimate; see `PROPOSAL.md` for what is measured, what is modelled, and the iOS limits.
 
+- **Experiment runner:** after sharing the model and dataset, the host's Metrics screen can run the selected schedulers N times each, interleaved (A B C, A B C …). Each run is reset, started, waited on until every image is done (or a time limit passes), and saved as its own files (`<name>_NN_<scheduler>_rK_*.csv`, `_report.txt`), plus `<name>_runs.csv` with one comparison row per run.
+- **Timeline:** the host's Metrics screen draws one row per phone with a bar per image (grey = download, black = inference) on the host's clock. Unit times in the exports are on the host's clock too.
+- **Fault injection:** on the host's Metrics screen, each worker can be **dropped** (gets no work; its results, uploads and health are refused, so its units come back when their 60 s leases expire, as for a crashed phone), given an extra **delay** on assignments and downloads, or a download **speed cap**. Faults are listed in report section 11 and cleared by a reset. From a laptop: `POST /admin/faults {"device": "<phone-ip>", "drop": true, "delay_ms": 1000, "bandwidth_kBps": 200}` (`{"device": ..., "clear": true}` or `{"clear_all": true}` to undo).
 - **Accuracy:** put YOLO label files in the dataset ZIP (`images/x.jpg` with `labels/x.txt`, or `x.txt` beside the image; class names from `classes.txt`, a `*.names` file or `data.yaml`, otherwise COCO's). The report then scores the finished images: precision, recall and mAP@0.5. Also at `/admin/accuracy`.
 
 ## Dynamic scheduling (Greedy, PSO, MOMPSO, MOMPSO-GA)

@@ -1,3 +1,4 @@
+import 'fault_injector.dart';
 import 'metrics/detection_accuracy.dart';
 import 'metrics/metrics_store.dart';
 import 'metrics/run_metrics.dart';
@@ -46,6 +47,7 @@ String buildExperimentReport({
   RunMetrics? run,
   List<RunMetrics> previousRuns = const [],
   AccuracyResult? accuracy,
+  List<FaultEvent> faults = const [],
 }) {
   final b = StringBuffer();
   final clients = devices.where((d) => !d.isMaster).toList();
@@ -236,6 +238,17 @@ String buildExperimentReport({
     final classes = accuracy.apByClass.entries.toList()..sort((a, c) => a.key.compareTo(c.key));
     for (final e in classes) {
       b.writeln('  AP ${e.key.padRight(16)} ${e.value.toStringAsFixed(3)}');
+    }
+  }
+
+  title('11. INJECTED FAULTS');
+  if (faults.isEmpty) {
+    b.writeln('None.');
+  } else {
+    for (final f in faults) {
+      final at = DateTime.fromMillisecondsSinceEpoch(f.t);
+      final offset = experimentStart == null ? '' : ' (+${(at.difference(experimentStart).inMilliseconds / 1000).toStringAsFixed(1)} s)';
+      b.writeln('${_stamp(at)}$offset  ${f.deviceKey}: ${f.fault.describe()}');
     }
   }
   return b.toString();

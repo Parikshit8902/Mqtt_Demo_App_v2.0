@@ -9,12 +9,16 @@ import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
 import '../services/assignments_client.dart';
 import '../services/distribution_singleton.dart';
+import '../services/experiment_runner.dart';
+import '../services/fault_injector.dart';
 import '../services/metrics/metrics_store.dart';
 import '../services/metrics/run_metrics.dart';
+import '../services/metrics/timeline.dart';
 import '../services/metrics/traffic_counter.dart';
 import '../services/mqtt_service.dart';
 import '../services/schedulers/scheduler_registry.dart';
 import '../widgets/file_name_dialog.dart';
+import '../widgets/timeline_chart.dart';
 
 /// Per-phone metrics: summary, charts, traffic/overhead breakdown, CSV/JSON export.
 /// On the broker phone it lists every phone; on a worker it shows that phone only.
@@ -29,6 +33,13 @@ class MetricsReportScreen extends StatefulWidget {
 enum _Chart { cpu, memory, network, power }
 
 class _MetricsReportScreenState extends State<MetricsReportScreen> {
+  // Kept outside the screen so a batch keeps running, and shows its
+  // progress again, when the screen is closed and reopened.
+  static ExperimentRunner? _runner;
+  final Set<String> _runnerSchedulers = {...SchedulerRegistry.ids};
+  int _runnerRepeats = 3;
+  int _runnerTimeoutMin = 30;
+
   final MetricsStore _store = MetricsStore.instance;
   String? _selectedKey;
   _Chart _chart = _Chart.cpu;
@@ -97,7 +108,18 @@ class _MetricsReportScreenState extends State<MetricsReportScreen> {
               _chartCard(device),
               const SizedBox(height: 12),
               _freshnessCard(device),
-              if (_isHost) ...[const SizedBox(height: 12), _workCard(), const SizedBox(height: 12), _runCard()],
+              if (_isHost) ...[
+                const SizedBox(height: 12),
+                _workCard(),
+                const SizedBox(height: 12),
+                _runCard(),
+                const SizedBox(height: 12),
+                _timelineCard(),
+                const SizedBox(height: 12),
+                _runnerCard(),
+                const SizedBox(height: 12),
+                _faultCard(),
+              ],
               const SizedBox(height: 16),
               _summaryGrid(summary),
               const SizedBox(height: 16),
@@ -571,6 +593,275 @@ class _MetricsReportScreenState extends State<MetricsReportScreen> {
             style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Which phone handled which image and when: one row per phone, a bar per
+  /// image (grey = download, black = inference), on the host's clock.
+  Widget _timelineCard() {
+    final tl = Timeline.build(_store.devices, originMs: _store.experimentStartMs);
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: _boxDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: const [
+            Icon(Icons.view_timeline_outlined, size: 16),
+            SizedBox(width: 6),
+            Text('Timeline', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          ]),
+          const SizedBox(height: 4),
+          Text(
+            'Each bar is one image: grey = download, black = inference. Seconds since the run started.',
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+          ),
+          const SizedBox(height: 8),
+          if (tl.rows.isEmpty)
+            Text('No finished images yet.', style: TextStyle(fontSize: 12, color: Colors.grey.shade600))
+          else
+            TimelineChart(tl),
+        ],
+      ),
+    );
+  }
+
+  /// Runs the selected schedulers back to back on the shared dataset and
+  /// saves each run's files, so a comparison needs one tap instead of a
+  /// reset / select / start / export cycle per run.
+  Widget _runnerCard() {
+    final runner = _runner;
+    final busy = runner?.state == RunnerState.running;
+    TextStyle small() => TextStyle(fontSize: 11, color: Colors.grey.shade700);
+
+    Widget body() {
+      if (busy) {
+        final r = runner!.running;
+        final p = runner.lastProgress;
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(
+            r == null
+                ? 'Finishing…'
+                : 'Run ${runner.current + 1} of ${runner.plan.length}: ${SchedulerRegistry.labelFor(r.scheduler)}, repeat ${r.repeat}',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          Text('${p['completed'] ?? 0} of ${p['total'] ?? 0} images done${(p['failed'] ?? 0) > 0 ? ', ${p['failed']} given up' : ''}',
+              style: small()),
+          const SizedBox(height: 6),
+          OutlinedButton(onPressed: runner.cancel, child: const Text('Stop after this check')),
+        ]);
+      }
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Wrap(spacing: 6, runSpacing: 4, children: [
+          for (final id in SchedulerRegistry.ids)
+            FilterChip(
+              label: Text(SchedulerRegistry.labelFor(id), style: const TextStyle(fontSize: 11)),
+              selected: _runnerSchedulers.contains(id),
+              onSelected: (on) => setState(() => on ? _runnerSchedulers.add(id) : _runnerSchedulers.remove(id)),
+            ),
+        ]),
+        Row(children: [
+          Text('Repeats ', style: small()),
+          DropdownButton<int>(
+            value: _runnerRepeats,
+            isDense: true,
+            items: [for (final n in [1, 2, 3, 5, 10]) DropdownMenuItem(value: n, child: Text('$n', style: small()))],
+            onChanged: (v) => setState(() => _runnerRepeats = v ?? 3),
+          ),
+          const SizedBox(width: 16),
+          Text('Give up a run after ', style: small()),
+          DropdownButton<int>(
+            value: _runnerTimeoutMin,
+            isDense: true,
+            items: [for (final n in [10, 30, 60, 120]) DropdownMenuItem(value: n, child: Text('$n min', style: small()))],
+            onChanged: (v) => setState(() => _runnerTimeoutMin = v ?? 30),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        ElevatedButton.icon(
+          onPressed: _runnerSchedulers.isEmpty ? null : _startRunner,
+          icon: const Icon(Icons.play_arrow, color: Colors.white, size: 18),
+          label: Text('Run ${_runnerSchedulers.length * _runnerRepeats} experiments', style: const TextStyle(color: Colors.white)),
+        ),
+        if (runner != null && runner.outcomes.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            runner.state == RunnerState.cancelled ? 'Last batch (stopped early):' : 'Last batch:',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          for (final o in runner.outcomes)
+            Text(
+              '${o.run.label}: ${o.completed}/${o.total} in ${o.took.inSeconds} s${o.finished ? '' : ' (timed out)'}',
+              style: small(),
+            ),
+          if (runner.error != null) Text('Error: ${runner.error}', style: const TextStyle(fontSize: 11, color: Colors.red)),
+        ],
+      ]);
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: _boxDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: const [
+            Icon(Icons.playlist_play, size: 16),
+            SizedBox(width: 6),
+            Text('Experiment runner', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          ]),
+          const SizedBox(height: 4),
+          Text(
+            'Runs each selected scheduler on the shared dataset, interleaved (A B C, A B C …), resetting between runs. '
+            'Each run is saved as its own files, plus one runs.csv comparing them. Share the model and dataset first.',
+            style: small(),
+          ),
+          const SizedBox(height: 8),
+          body(),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startRunner() async {
+    final svc = widget.mqttService;
+    if (svc == null) return;
+    final name = await askFileName(context, title: 'Name for this batch of runs');
+    if (name == null || !mounted) return;
+    final base = MetricsStore.safeFileName(name);
+    final dir = await _exportDir();
+    final jobId = svc.currentJobId;
+    var index = 0;
+    final runner = ExperimentRunner(
+      schedulers: SchedulerRegistry.ids.where(_runnerSchedulers.contains).toList(),
+      repeats: _runnerRepeats,
+      timeout: Duration(minutes: _runnerTimeoutMin),
+      hooks: RunnerHooks(
+        reset: () async => svc.resetExperiment(),
+        setScheduler: (id) {
+          distributionManager.setScheduler(id);
+          _store.schedulerId = id;
+        },
+        start: () async {
+          distributionManager.activateJob(jobId);
+          await svc.announceWorkAvailable(jobId);
+        },
+        progress: () => distributionManager.jobProgress(jobId),
+        export: (run) async {
+          final prefix = '${base}_${(++index).toString().padLeft(2, '0')}_${run.label}';
+          await _store.exportTo(dir, baseName: prefix);
+          // The plain-text report too, while this run is still current.
+          try {
+            final url = Uri.parse('${svc.serverUrl}/admin/metrics').replace(queryParameters: {'name': prefix});
+            final resp = await http.get(url);
+            if (resp.statusCode == 200) await File('${dir.path}/${prefix}_report.txt').writeAsString(resp.body);
+          } catch (_) {}
+        },
+        exportSummary: () async {
+          await dir.create(recursive: true);
+          await File('${dir.path}/${base}_runs.csv').writeAsString(_store.runsCsv());
+        },
+      ),
+    );
+    setState(() => _runner = runner);
+    runner.addListener(() {
+      if (mounted) setState(() {});
+    });
+    await runner.run();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('${runner.outcomes.length} runs saved to ${dir.path} (${base}_runs.csv compares them)'),
+      duration: const Duration(seconds: 8),
+    ));
+  }
+
+  /// Make a worker misbehave on purpose: drop it, slow its link, or cap its
+  /// download speed. Applied by the host; listed in the report.
+  Widget _faultCard() {
+    final faults = FaultInjector.instance;
+    final workers = _store.devices.where((d) => !d.isLocal).toList();
+    const delays = [0, 250, 1000, 3000];
+    const caps = <double?>[null, 500, 200, 50];
+    TextStyle small() => TextStyle(fontSize: 11, color: Colors.grey.shade700);
+
+    return AnimatedBuilder(
+      animation: faults,
+      builder: (context, _) => Container(
+        padding: const EdgeInsets.all(12),
+        decoration: _boxDecoration(),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: const [
+              Icon(Icons.science_outlined, size: 16),
+              SizedBox(width: 6),
+              Text('Fault injection', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+            ]),
+            const SizedBox(height: 4),
+            Text('Test a scheduler against a phone that drops out or has a slow link. Cleared on reset.', style: small()),
+            const SizedBox(height: 8),
+            if (workers.isEmpty)
+              Text('No workers have reported yet.', style: TextStyle(fontSize: 12, color: Colors.grey.shade600))
+            else
+              for (final d in workers)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Builder(builder: (context) {
+                    final f = faults.faultFor(d.key);
+                    void update({bool? drop, int? delay, double? cap, bool clearCap = false}) => faults.set(
+                          d.key,
+                          PhoneFault(
+                            dropped: drop ?? f.dropped,
+                            extraDelayMs: delay ?? f.extraDelayMs,
+                            bandwidthKBps: clearCap ? null : (cap ?? f.bandwidthKBps),
+                          ),
+                        );
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('${d.name}  ${d.key}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        Wrap(
+                          spacing: 12,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Text('Drop', style: small()),
+                              Switch(value: f.dropped, onChanged: (v) => update(drop: v)),
+                            ]),
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Text('Delay ', style: small()),
+                              DropdownButton<int>(
+                                value: delays.contains(f.extraDelayMs) ? f.extraDelayMs : 0,
+                                isDense: true,
+                                items: [
+                                  for (final ms in delays)
+                                    DropdownMenuItem(value: ms, child: Text(ms == 0 ? 'none' : '$ms ms', style: small())),
+                                ],
+                                onChanged: (v) => update(delay: v ?? 0),
+                              ),
+                            ]),
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Text('Speed cap ', style: small()),
+                              DropdownButton<double?>(
+                                value: caps.contains(f.bandwidthKBps) ? f.bandwidthKBps : null,
+                                isDense: true,
+                                items: [
+                                  for (final c in caps)
+                                    DropdownMenuItem(value: c, child: Text(c == null ? 'none' : '${c.toStringAsFixed(0)} kB/s', style: small())),
+                                ],
+                                onChanged: (v) => update(cap: v, clearCap: v == null),
+                              ),
+                            ]),
+                          ],
+                        ),
+                      ],
+                    );
+                  }),
+                ),
+          ],
+        ),
       ),
     );
   }

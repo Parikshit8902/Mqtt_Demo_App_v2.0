@@ -128,24 +128,27 @@ class ClientWorkerService extends ChangeNotifier {
               // Health rides along with the result so the host sees the phone's state at the
               // moment it finished, which is fresher than the 5 s MQTT sample.
               final rr = ResultReport(jobId: jobId, clientId: clientId, unitIndex: unit.unitIndex, ttprocMs: ttMs, bandwidthKbps: bwKbps, bytes: bytes.length, downloadMs: dlMs, totalMs: totalMs, detections: (detections as List<dynamic>?), resultUri: null, warmup: false, health: PerformanceService.instance.currentHealth);
-              MetricsStore.instance.recordUnit(
-                deviceKeyFromClientId(clientId),
-                UnitRecord(
-                  deviceKey: deviceKeyFromClientId(clientId),
-                  jobId: jobId,
-                  unitIndex: unit.unitIndex,
-                  bytes: bytes.length,
-                  downloadMs: dlMs,
-                  inferMs: ttMs,
-                  totalMs: totalMs,
-                  downloadKBps: bwKbps,
-                  scheduler: '',
-                  t: DateTime.now().millisecondsSinceEpoch,
-                ),
-              );
+              final finishedAt = DateTime.now().millisecondsSinceEpoch;
               _didWork = true;
               final ok = await _assignClient.postResult(rr);
               if (ok) {
+                // Only a result the host accepted is a finished unit; one it
+                // refused goes back to the pool and is done by another phone.
+                MetricsStore.instance.recordUnit(
+                  deviceKeyFromClientId(clientId),
+                  UnitRecord(
+                    deviceKey: deviceKeyFromClientId(clientId),
+                    jobId: jobId,
+                    unitIndex: unit.unitIndex,
+                    bytes: bytes.length,
+                    downloadMs: dlMs,
+                    inferMs: ttMs,
+                    totalMs: totalMs,
+                    downloadKBps: bwKbps,
+                    scheduler: '',
+                    t: finishedAt,
+                  ),
+                );
                 _logger.log('✅ Posted result for unit ${unit.unitIndex} (infer=${ttMs}ms download=${dlMs}ms bw=${bwKbps.toStringAsFixed(1)}kB/s)');
               } else {
                 _logger.log('⚠️ Failed to post result for unit ${unit.unitIndex}');

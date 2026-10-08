@@ -164,6 +164,7 @@ void main() {
       expect(u.scheduler, 'greedy');
       expect(u.bytes, 2048, reason: "the worker's richer record wins");
       expect(s.device('10.0.0.9')!.units.length, 1, reason: 'no duplicate');
+      expect(u.t, 1, reason: "the host's own time stamp is kept, on the host's clock");
     });
 
     test('CSV export has a header and one row per sample, and files are written', () async {

@@ -12,6 +12,7 @@ import 'package:uuid/uuid.dart';
 import 'message_logger.dart';
 import 'distribution_manager.dart' show UnitFailureOutcome;
 import 'distribution_singleton.dart';
+import 'fault_injector.dart';
 import 'models/result_dto.dart';
 import 'models/assignment.dart';
 import 'network_helper.dart';
@@ -233,6 +234,17 @@ class FileServerService {
         _handleMetricsCsv,
       );
 
+      // Fault injection: per-phone drop, delay and bandwidth cap.
+      router.get(
+        '/admin/faults',
+        _handleGetFaults,
+      );
+
+      router.post(
+        '/admin/faults',
+        _handleSetFaults,
+      );
+
       // Detection accuracy against YOLO labels shipped in the dataset ZIP.
       router.get(
         '/admin/accuracy',
@@ -285,6 +297,7 @@ class FileServerService {
           .addMiddleware(logMiddleware)
           .addMiddleware(_trafficMiddleware())
           .addMiddleware(_pinMiddleware())
+          .addMiddleware(_linkFaultMiddleware())
           .addHandler(router.call);
 
       _logger.log(
@@ -803,6 +816,8 @@ class FileServerService {
 
   /// Id the current job is registered under: the most recently shared dataset
   /// (zip / coco), or 'demo_job' when none has been shared.
+  String get currentJobId => _currentJobId();
+
   String _currentJobId() {
     for (final f in _sharedFiles.values.toList().reversed) {
       if (f.mimeType == 'application/zip' ||
@@ -1309,26 +1324,34 @@ class FileServerService {
   /// - scheduler logs
   /// - result reports
   /// - experiment metrics
+  /// Clear everything specific to the current experiment (unit status,
+  /// logs, results, faults, metrics; the finished run's comparison numbers
+  /// are kept). Jobs stay registered but hand out no work until activated.
+  void resetExperiment() {
+    _logger.log(
+      '🔄 Resetting current experiment...',
+    );
+
+    // Reset scheduler/unit assignment state.
+    distributionManager.resetExperiment();
+
+    // Clear experiment-specific server state.
+    _schedulerLogs.clear();
+    _resultReportsByJob.clear();
+    _detectionsByJob.clear();
+    FaultInjector.instance.reset();
+    MetricsStore.instance.clear();
+
+    _logger.log(
+      '✅ Experiment state reset successfully',
+    );
+  }
+
   Future<shelf.Response> _handleResetExperiment(
     shelf.Request request,
   ) async {
     try {
-      _logger.log(
-        '🔄 Resetting current experiment...',
-      );
-
-      // Reset scheduler/unit assignment state.
-      distributionManager.resetExperiment();
-
-      // Clear experiment-specific server state.
-      _schedulerLogs.clear();
-      _resultReportsByJob.clear();
-      _detectionsByJob.clear();
-      MetricsStore.instance.clear();
-
-      _logger.log(
-        '✅ Experiment state reset successfully',
-      );
+      resetExperiment();
 
       return shelf.Response.ok(
         jsonEncode({
@@ -1552,6 +1575,7 @@ class FileServerService {
       run: store.runMetrics(),
       previousRuns: store.runHistory,
       accuracy: accuracy,
+      faults: FaultInjector.instance.history,
     );
   }
 
@@ -2039,6 +2063,28 @@ class FileServerService {
         }
       } catch (_) {}
 
+      // Injected faults: a slow link answers late; a dropped phone gets
+      // no work and is not marked alive, as if it had gone silent.
+      final faults = FaultInjector.instance;
+      final device = deviceKeyFromClientId(clientId);
+
+      await faults.delayFor(device);
+
+      if (faults.isDropped(device)) {
+        return shelf.Response.ok(
+          jsonEncode(
+            PerClientAssignment(
+              jobId: jobId,
+              clientId: clientId,
+              units: const [],
+            ).toJson(),
+          ),
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        );
+      }
+
       // Asking for work proves the phone is alive, even before it has
       // finished a unit or sent any metrics.
       distributionManager.touchClient(clientId);
@@ -2289,6 +2335,17 @@ class FileServerService {
       final rr =
           ResultReport.fromJson(j);
 
+      // A dropped phone's results are lost, so its units come back to the
+      // pool when their leases expire.
+      if (FaultInjector.instance.isDropped(
+        deviceKeyFromClientId(rr.clientId),
+      )) {
+        return shelf.Response(
+          503,
+          body: 'dropped by fault injection',
+        );
+      }
+
       if (rr.failed) {
         return _handleFailedUnit(jobId, rr);
       }
@@ -2528,6 +2585,65 @@ class FileServerService {
     }
   }
 
+  Future<shelf.Response> _handleGetFaults(
+    shelf.Request request,
+  ) async {
+    return shelf.Response.ok(
+      jsonEncode(FaultInjector.instance.toJson()),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    );
+  }
+
+  /// `{"device": "<ip>", "drop": true, "delay_ms": 500, "bandwidth_kBps": 200}`
+  /// sets that phone's fault (omitted fields are off); `{"device": "<ip>",
+  /// "clear": true}` removes it and `{"clear_all": true}` removes them all.
+  Future<shelf.Response> _handleSetFaults(
+    shelf.Request request,
+  ) async {
+    try {
+      final j = jsonDecode(await request.readAsString());
+
+      if (j is! Map<String, dynamic>) {
+        return shelf.Response(400, body: 'expected object');
+      }
+
+      final faults = FaultInjector.instance;
+
+      if (j['clear_all'] == true) {
+        for (final device in faults.active.keys.toList()) {
+          faults.clear(device);
+        }
+      } else {
+        final device = j['device'];
+
+        if (device is! String || device.isEmpty) {
+          return shelf.Response(400, body: 'missing device');
+        }
+
+        final fault = j['clear'] == true
+            ? const PhoneFault()
+            : PhoneFault.fromJson(j);
+
+        faults.set(device, fault);
+
+        _logger.log(
+          '🧪 Fault for $device: ${fault.describe()}',
+        );
+      }
+
+      return shelf.Response.ok(
+        jsonEncode(faults.toJson()),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      );
+    } catch (e) {
+      return shelf.Response(400, body: 'bad request: $e');
+    }
+  }
+
   Future<shelf.Response> _handleAccuracy(
     shelf.Request request,
   ) async {
@@ -2646,6 +2762,35 @@ class FileServerService {
     };
   }
 
+  /// Injected link faults for file downloads, keyed by the requesting
+  /// phone's IP: an extra delay before the response, and a speed cap on it.
+  shelf.Middleware _linkFaultMiddleware() {
+    return (shelf.Handler inner) {
+      return (shelf.Request request) async {
+        if (!request.url.path.startsWith('files/')) {
+          return inner(request);
+        }
+
+        final info = request.context['shelf.io.connection_info'];
+        final device = info is HttpConnectionInfo
+            ? info.remoteAddress.address
+            : null;
+        final fault = FaultInjector.instance.faultFor(device);
+
+        await FaultInjector.instance.delayFor(device);
+
+        final response = await inner(request);
+        final cap = fault.bandwidthKBps;
+
+        return cap == null
+            ? response
+            : response.change(
+                body: throttleStream(response.read(), cap),
+              );
+      };
+    };
+  }
+
   bool _fromThisPhone(shelf.Request request) {
     final info = request.context['shelf.io.connection_info'];
 
@@ -2691,6 +2836,10 @@ class FileServerService {
     try {
       final j = jsonDecode(await request.readAsString());
       if (j is! Map<String, dynamic>) return shelf.Response(400, body: 'expected object');
+      // Its units were refused, so its own record of them must not count.
+      if (FaultInjector.instance.isDropped(j['key'] as String?)) {
+        return shelf.Response(503, body: 'dropped by fault injection');
+      }
       MetricsStore.instance.mergeDeviceReport(j);
       _logger.log('📊 Metrics report received from ${j['name']} (${j['key']})');
       return shelf.Response.ok(jsonEncode({'status': 'ok'}), headers: {'Content-Type': 'application/json'});

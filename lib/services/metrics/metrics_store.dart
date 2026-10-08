@@ -163,7 +163,7 @@ class UnitRecord {
   final int totalMs; // download + inference (excludes result upload)
   final double downloadKBps; // effective download throughput (bytes / downloadMs)
   final String scheduler;
-  final int t; // epoch ms when finished
+  final int t; // epoch ms when finished; the host's clock in the host's records
 
   UnitRecord({
     required this.deviceKey,
@@ -491,23 +491,27 @@ class MetricsStore extends ChangeNotifier {
         ..clear()
         ..addAll(samples.whereType<Map>().map((m) => MetricSample.fromWire(Map<String, dynamic>.from(m))));
     }
+    if (d.clockOffsetMs == null && d.samples.isNotEmpty) {
+      d.clockOffsetMs = DateTime.now().millisecondsSinceEpoch - d.samples.last.t;
+    }
     final units = report['units'];
     if (units is List) {
       for (final u in units.whereType<Map>()) {
         final incoming = Map<String, dynamic>.from(u);
-        var rec = UnitRecord.fromJson(incoming, deviceKey: key);
+        final rec = UnitRecord.fromJson(incoming, deviceKey: key);
+        final hostRecord = d.units[rec.id];
         if (rec.scheduler.isEmpty) {
           // Workers don't know the active scheduler; keep what the host stamped.
-          incoming['scheduler'] = d.units[rec.id]?.scheduler ?? schedulerId;
-          rec = UnitRecord.fromJson(incoming, deviceKey: key);
+          incoming['scheduler'] = hostRecord?.scheduler ?? schedulerId;
         }
-        d.units[rec.id] = rec;
+        // Unit times are kept on the host's clock, so phones line up on one
+        // timeline: the host's own stamp if it has one, else the worker's
+        // time shifted by the phone's clock offset.
+        incoming['t'] = hostRecord?.t ?? d.hostTime(rec.t);
+        d.units[rec.id] = UnitRecord.fromJson(incoming, deviceKey: key);
       }
     }
     if (report['traffic'] is Map) d.traffic = Map<String, dynamic>.from(report['traffic'] as Map);
-    if (d.clockOffsetMs == null && d.samples.isNotEmpty) {
-      d.clockOffsetMs = DateTime.now().millisecondsSinceEpoch - d.samples.last.t;
-    }
     d.lastSeen = DateTime.now().millisecondsSinceEpoch;
     notifyListeners();
   }
