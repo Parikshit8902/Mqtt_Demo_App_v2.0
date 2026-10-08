@@ -32,6 +32,11 @@ class FileServerService {
   final Function()? _onStateChanged;
   final Map<String, _SharedFile> _sharedFiles = {};
 
+  /// Called with a job id when that job has units to hand out (it was just
+  /// registered, or a failed unit went back to the pool), so the host can
+  /// tell idle workers to ask now.
+  void Function(String jobId)? onWorkAvailable;
+
   /// Shared ZIPs extracted once, so serving an image is a file read rather
   /// than a full decode of the dataset on every request.
   final ZipEntryCache _zipCache = ZipEntryCache(
@@ -1126,6 +1131,8 @@ class FileServerService {
               '${jobUnits.length} units for '
               'scheduling demo',
             );
+
+            onWorkAvailable?.call(jobId);
           }
         } catch (e) {
           _logger.log(
@@ -2417,6 +2424,10 @@ class FileServerService {
 
     if (_schedulerLogs.length > 50) {
       _schedulerLogs.removeLast();
+    }
+
+    if (outcome == UnitFailureOutcome.requeued) {
+      onWorkAvailable?.call(jobId);
     }
 
     return shelf.Response.ok(

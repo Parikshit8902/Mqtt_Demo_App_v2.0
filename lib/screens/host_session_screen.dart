@@ -780,6 +780,8 @@ class _HostSessionScreenState
       // The reset marks registered jobs inactive. Reactivate the
       // dataset job for this newly submitted experiment.
       distributionManager.activateJob(jobId);
+      // Idle workers back off between polls; tell them to ask now.
+      widget.mqttService.announceWorkAvailable(jobId);
 
       // post job options
       try {

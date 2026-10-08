@@ -90,26 +90,61 @@ class PerformanceService with WidgetsBindingObserver {
   
   // --- Lifecycle Management ---
   
+  // Who is running an experiment on this phone (a worker, a hosted session).
+  // While anyone is, the screen is kept on and backgrounding does not stop
+  // the sampling timer, so the recording has no gaps.
+  final Set<String> _runHolders = {};
+
+  bool get runActive => _runHolders.isNotEmpty;
+
+  /// Keep sampling, and keep the screen on, until [endRun] with the same [who].
+  void beginRun(String who) {
+    final first = _runHolders.isEmpty;
+    _runHolders.add(who);
+    if (first) {
+      _setKeepScreenOn(true);
+      _startTimer();
+    }
+  }
+
+  void endRun(String who) {
+    if (_runHolders.remove(who) && _runHolders.isEmpty) {
+      _setKeepScreenOn(false);
+    }
+  }
+
+  Future<void> _setKeepScreenOn(bool on) async {
+    try {
+      await platform.invokeMethod('setKeepScreenOn', {'on': on});
+    } catch (_) {
+      // Desktop builds and tests have no such method; sampling still works.
+    }
+  }
+
+  /// Whether the sampling timer runs in [state]. `inactive` is transient (the
+  /// notification shade, the app switcher, a system dialog), so it never stops
+  /// sampling; leaving the foreground only does when no experiment is running.
+  static bool samplesIn(AppLifecycleState state, {required bool runActive}) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+      case AppLifecycleState.inactive:
+        return true;
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        return runActive;
+    }
+  }
+
   @override
   // This method is called automatically by the Flutter framework.
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    switch (state) {
-      case AppLifecycleState.resumed:
-        // The app has come into the foreground.
-        print("✅ App resumed, starting performance timer.");
-        _startTimer();
-        break;
-      case AppLifecycleState.inactive:
-      case AppLifecycleState.paused:
-      case AppLifecycleState.detached:
-        // The app is in the background or closing.
-        print("⛔️ App paused, stopping performance timer to save battery.");
-        _stopTimer();
-        break;
-      case AppLifecycleState.hidden:
-        // This state is not used on Android/iOS, but good practice to handle.
-        break;
+    if (samplesIn(state, runActive: runActive)) {
+      _startTimer();
+    } else {
+      print("⛔️ App in background with no experiment running, stopping performance timer to save battery.");
+      _stopTimer();
     }
   }
 

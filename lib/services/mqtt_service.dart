@@ -59,6 +59,7 @@ class MqttService extends ChangeNotifier {
       onStateChanged: notifyListeners,
     );
     _fileServerService = FileServerService(_logger, onStateChanged: notifyListeners);
+    _fileServerService.onWorkAvailable = announceWorkAvailable;
     _fileDownloadService = FileDownloadService(_logger, onStateChanged: notifyListeners);
     
     // Listen to client tracker changes
@@ -70,6 +71,17 @@ class MqttService extends ChangeNotifier {
     addMessageListener('clients/metrics', (topic, message) => MetricsStore.instance.ingestWire(message));
     // The same samples tell the scheduler how each phone is doing right now.
     addMessageListener('clients/metrics', _feedSchedulerHealth);
+  }
+
+  /// Topic on which the host tells idle workers that a job has units to hand
+  /// out, so they ask now instead of waiting out their polling backoff.
+  static const String workAvailableTopic = 'work/available';
+
+  /// Host only: announce that [jobId] has work (a job was registered or
+  /// reactivated, or a failed unit went back to the pool).
+  Future<void> announceWorkAvailable(String jobId) async {
+    if (!_brokerMonitoringClientConnected) return;
+    await _clientManager.publishMessage(message: jobId, topic: workAvailableTopic);
   }
 
   /// Hand a worker's live health (battery, thermal, RAM, Wi-Fi, CPU) to the
@@ -168,6 +180,9 @@ class MqttService extends ChangeNotifier {
       if (hostIp != null) {
         MetricsStore.instance.setLocalIdentity(hostIp, (await DeviceInfoHelper.getDeviceName()) ?? 'Host');
       }
+      // The host phone must stay awake to serve files and assignments, and its
+      // own metrics should have no gaps while it does.
+      PerformanceService.instance.beginRun('host');
       // Connect a local client for the host to be able to publish messages
       await _setupHostPublishingClient();
       
@@ -210,6 +225,7 @@ class MqttService extends ChangeNotifier {
   }
   
   Future<void> stopBroker() async {
+    PerformanceService.instance.endRun('host');
     // Stop the file server
     await _fileServerService.stopServer();
     
@@ -239,6 +255,10 @@ class MqttService extends ChangeNotifier {
   await _clientManager.subscribeToTopic('dist/data');
   addMessageListener('dist/mod', _handleDistributedShare);
   addMessageListener('dist/data', _handleDistributedShare);
+
+  // The host announces new work here; an idle worker then asks right away.
+  await _clientManager.subscribeToTopic(workAvailableTopic);
+  addMessageListener(workAvailableTopic, (topic, message) => _clientWorkerService?.nudge());
       
       // Start client metrics publishing
       startClientMetricsPublishing();
@@ -309,6 +329,8 @@ class MqttService extends ChangeNotifier {
                     final assignClient = AssignmentsClient(_logger, serverBase: serverBase);
                     final inference = InferenceService(modelPath: modelFile.path);
                     final jobId = shareInfo.fileId.isNotEmpty ? shareInfo.fileId : 'demo_job';
+                    // A new dataset replaces the previous job; two workers must not run at once.
+                    _clientWorkerService?.stop();
                     _clientWorkerService = ClientWorkerService(_logger, assignClient, inference, jobId: jobId, clientId: _clientManager.clientId);
                     // start worker without awaiting to keep UI responsive
                     _clientWorkerService!.start();
@@ -437,6 +459,9 @@ class MqttService extends ChangeNotifier {
   }
   
   Future<void> disconnect() async {
+    // A worker left running would keep polling the host and keep the screen on.
+    _clientWorkerService?.stop();
+    _clientWorkerService = null;
     // Stop client metrics publishing
     stopClientMetricsPublishing();
     await _clientManager.disconnect();
@@ -732,9 +757,20 @@ class MqttService extends ChangeNotifier {
     notifyListeners();
   }
   
+  // Disposing stops the broker and file server, which finish asynchronously
+  // and report their state change after this service is gone.
+  bool _disposed = false;
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
   @override
   void dispose() {
+    _disposed = true;
     _logger.log('🧹 Disposing MqttService');
+    _clientWorkerService?.stop();
     _clientTracker.removeListener(notifyListeners);
     _clientManager.dispose();
     _brokerManager.dispose();

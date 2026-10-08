@@ -73,6 +73,12 @@ final class PerformanceChannel {
         result(["charging": state == .charging || state == .full])
       case "getDeviceHealth":
         result(self.deviceHealth())
+      case "setKeepScreenOn":
+        // Keeps the app in the foreground while an experiment runs; iOS suspends a
+        // backgrounded app within seconds, which would stop sampling and serving.
+        let on = (call.arguments as? [String: Any])?["on"] as? Bool ?? false
+        UIApplication.shared.isIdleTimerDisabled = on
+        result(nil)
       default:
         result(FlutterMethodNotImplemented)
       }

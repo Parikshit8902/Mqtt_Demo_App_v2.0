@@ -441,6 +441,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.system.Os
 import android.system.OsConstants
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -501,6 +502,17 @@ class MainActivity: FlutterActivity() {
 
                 // Live device state for the dynamic schedulers (memory, thermal, charging, Wi-Fi link).
                 "getDeviceHealth" -> result.success(deviceHealth())
+
+                // Keeps the screen on while an experiment runs, so the app stays in the
+                // foreground and its sampling timer is not stopped or frozen.
+                "setKeepScreenOn" -> {
+                    if (call.argument<Boolean>("on") == true) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    result.success(null)
+                }
 
                 "getBatteryDetails" -> {
                     val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)

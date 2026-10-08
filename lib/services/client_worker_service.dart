@@ -11,6 +11,7 @@ import 'utils/metrics.dart';
 import 'metrics/metrics_store.dart';
 import 'metrics/traffic_counter.dart';
 import 'performance_service.dart';
+import 'utils/idle_wait.dart';
 
 class ClientWorkerService extends ChangeNotifier {
   final MessageLogger _logger;
@@ -24,18 +25,44 @@ class ClientWorkerService extends ChangeNotifier {
   String jobId;
   String clientId;
 
+  // While the host has no work, polls back off from 2 s to 16 s. The host
+  // announces new work over MQTT (see nudge), which cuts the wait short.
+  final IdleBackoff _idle = IdleBackoff();
+  final WakeableDelay _delay = WakeableDelay();
+
+  // This worker's hold on keeping the screen on; per instance, so a worker
+  // that is replaced and stops late cannot release its successor's hold.
+  late final String _runName = 'worker@${identityHashCode(this)}';
+
   ClientWorkerService(this._logger, this._assignClient, this._inferenceService, {required this.jobId, required this.clientId});
 
   bool get isRunning => _running;
+
+  /// The host announced that work is available: ask now instead of waiting
+  /// out the idle backoff.
+  void nudge() {
+    _idle.reset();
+    _delay.wake();
+  }
 
   Future<void> start() async {
     if (_running) return;
     _running = true;
     notifyListeners();
+    // Keeps the screen on and the metrics sampling for the whole run.
+    PerformanceService.instance.beginRun(_runName);
     MetricsStore.instance.setLocalIdentity(deviceKeyFromClientId(clientId), deviceNameFromClientId(clientId));
     _logger.log('🚧 Client worker started for job $jobId');
     // Ensure model is loaded
-    await _inferenceService.loadModel();
+    try {
+      await _inferenceService.loadModel();
+    } catch (e) {
+      _logger.log('❌ Could not load the model, worker not started: $e');
+      _running = false;
+      PerformanceService.instance.endRun(_runName);
+      notifyListeners();
+      return;
+    }
 
     while (_running) {
       try {
@@ -46,10 +73,12 @@ class ClientWorkerService extends ChangeNotifier {
             _didWork = false;
             await pushMetricsReport();
           }
-          _logger.log('ℹ️ No assignments available, sleeping 2s');
-          await Future.delayed(const Duration(seconds: 2));
+          final wait = _idle.next();
+          _logger.log('ℹ️ No assignments available, next check in ${wait.inSeconds}s');
+          await _delay.sleep(wait);
           continue;
         }
+        _idle.reset();
 
         for (final unit in assignment.units) {
           if (!_running) break;
@@ -139,10 +168,11 @@ class ClientWorkerService extends ChangeNotifier {
         }
       } catch (e) {
         _logger.log('❌ Worker loop error: $e');
-        await Future.delayed(const Duration(seconds: 2));
+        await _delay.sleep(const Duration(seconds: 2));
       }
     }
 
+    PerformanceService.instance.endRun(_runName);
     _logger.log('🛑 Client worker stopped');
     notifyListeners();
   }
@@ -180,5 +210,7 @@ class ClientWorkerService extends ChangeNotifier {
 
   void stop() {
     _running = false;
+    // An idle worker would otherwise sleep out its backoff before exiting.
+    _delay.wake();
   }
 }

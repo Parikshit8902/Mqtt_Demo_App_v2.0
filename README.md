@@ -49,7 +49,7 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 All four schedulers now decide from live data instead of two static numbers. The host sees, per worker: CPU load, free RAM, battery and charging, thermal status, Wi-Fi signal (Android), measured bandwidth and inference time, queue depth, recent latency and a power class by device model. Workers report health every 5 s over MQTT and with every finished unit.
 - **Shared model** (`lib/services/schedulers/scheduling_model.dart`): the health score is the DetectNet `hScore` formula driven by live values; thermal, battery, memory, Wi-Fi signal and recently failed units derate a phone's capacity; phones at <=5% battery (unplugged), critical thermal state, low memory or repeatedly failed units (timeouts or reported errors) get no new work (unless every phone is in that state); each assignment lengthens that phone's queue, which spreads a batch.
 - **Algorithms** keep the structure of the `Parikshit` versions and DetectNet: Greedy = earliest estimated finish; PSO = lightweight swarm over health scores; MOMPSO = weighted health / latency / queue / energy; MOMPSO-GA = MOMPSO plus 70/30 blend and mutation. Default MOMPSO weights are the DetectNet ones scaled by 0.8 with 0.2 for energy (`ObjectiveWeights`).
-- **Robustness:** units not finished within 60 s are requeued; a worker whose download or inference fails reports it and the unit is requeued at once (a failure is never counted as a finished image), and a unit that fails 3 times is skipped so the job can finish; silent phones are dropped from planning; a shared dataset ZIP is extracted once and images are served from disk; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
+- **Robustness:** units not finished within 60 s are requeued; a worker whose download or inference fails reports it and the unit is requeued at once (a failure is never counted as a finished image), and a unit that fails 3 times is skipped so the job can finish; silent phones are dropped from planning; a shared dataset ZIP is extracted once and images are served from disk; idle workers poll every 2 s doubling to 16 s, and the host wakes them on the `work/available` MQTT topic when work appears; while a phone hosts or works, its screen stays on and metrics keep sampling; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
 - **Limits:** PSO and MOMPSO-GA are DetectNet's heuristics (PSO's fitness reduces to ranking by health; GA's closest-to-blend pick selects the top mutated score), not literature-faithful multi-objective PSO/GA. The thresholds in `HealthPolicy` are heuristics to calibrate. CPU load is the app's own process CPU. The Android Kotlin additions could not be compiled in the authoring environment.
 
 ## Basic troubleshooting (non-technical)
@@ -72,6 +72,7 @@ If you are curious or want to run the project from source, here are a few short 
 - To run from source:
   1. Install Flutter and set up your platform (Android or iOS).
   2. In the project folder run: `flutter pub get` then `flutter run`.
+- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request.
 
 If you'd like, we can add back a full developer section with dependency versions and code structure.
 
