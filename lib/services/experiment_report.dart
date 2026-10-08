@@ -40,6 +40,7 @@ String buildExperimentReport({
   String? datasetName,
   int? datasetBytes,
   int datasetUnits = 0,
+  String imageSetting = 'original',
   required String schedulerName,
   int scheduleCalls = 0,
   double avgScheduleMs = 0,
@@ -82,6 +83,7 @@ String buildExperimentReport({
     b.writeln('Name  : $datasetName');
     b.writeln('Size  : ${datasetBytes == null ? 'unknown' : '${_bytes(datasetBytes)} ($datasetBytes bytes)'}');
     b.writeln('Units : $datasetUnits images / work units');
+    b.writeln('Served: ${imageSetting == 'original' ? 'original images' : imageSetting}');
   }
 
   title('4. SCHEDULING ALGORITHM');

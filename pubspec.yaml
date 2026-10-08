@@ -70,6 +70,7 @@ dependencies:
 
   # For Google Fonts
   google_fonts: ^8.2.1
+  image: ^4.3.0
 
 dev_dependencies:
   flutter_test:

@@ -4,6 +4,9 @@
 class RunMetrics {
   final String scheduler;
 
+  /// How the host served the images (see ImageVariant.label).
+  final String images;
+
   /// Host clock, epoch ms: first assignment and last result of the run.
   final int? startMs;
   final int? endMs;
@@ -31,6 +34,7 @@ class RunMetrics {
 
   const RunMetrics({
     required this.scheduler,
+    this.images = 'original',
     required this.startMs,
     required this.endMs,
     required this.units,
@@ -55,6 +59,7 @@ class RunMetrics {
   /// fairness); [totalEnergyJ] is the modelled energy of every phone.
   factory RunMetrics.compute({
     required String scheduler,
+    String images = 'original',
     required int? startMs,
     required int? endMs,
     required List<({String unitId, String phone, int latencyMs})> latencies,
@@ -72,6 +77,7 @@ class RunMetrics {
     final mean = sorted.isEmpty ? 0.0 : sorted.reduce((a, b) => a + b) / sorted.length;
     return RunMetrics(
       scheduler: scheduler,
+      images: images,
       startMs: startMs,
       endMs: endMs,
       units: distinct,
@@ -105,12 +111,14 @@ class RunMetrics {
   static const csvHeader = [
     'scheduler', 'start_ms', 'end_ms', 'makespan_s', 'units', 'phones', 'throughput_per_s',
     'latency_mean_ms', 'latency_p50_ms', 'latency_p95_ms', 'jain_units', 'jain_busy', 'energy_per_image_j',
+    'images',
   ];
 
   List<Object?> csvCells() => [
         scheduler, startMs, endMs, _r(makespanS), units, phones, _r(throughput, 4),
         _r(meanLatencyMs), _r(p50LatencyMs), _r(p95LatencyMs), _r(jainUnits, 4), _r(jainBusy, 4),
         energyPerImageJ == null ? null : _r(energyPerImageJ!, 3),
+        images,
       ];
 
   Map<String, dynamic> toJson() => {

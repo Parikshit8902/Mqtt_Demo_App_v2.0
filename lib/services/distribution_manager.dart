@@ -912,6 +912,31 @@ class DistributionManager {
   // JOB QUERIES
   // ---------------------------------------------------------------------------
 
+  /// Replace the byte size of [jobId]'s units (the schedulers estimate
+  /// transfer time from it), e.g. when the host serves its images smaller.
+  void setUnitSizes(
+    String jobId,
+    Map<int, int> bytesByUnit,
+  ) {
+    final units = _jobs[jobId];
+
+    if (units == null) return;
+
+    for (var i = 0; i < units.length; i++) {
+      final u = units[i];
+      final bytes = bytesByUnit[u.unitIndex];
+
+      if (bytes == null || bytes <= 0) continue;
+
+      units[i] = Unit(
+        unitIndex: u.unitIndex,
+        start: u.start,
+        end: u.start + bytes - 1,
+        fileUrl: u.fileUrl,
+      );
+    }
+  }
+
   /// Return whether a job is registered.
   bool hasJob(
     String jobId,

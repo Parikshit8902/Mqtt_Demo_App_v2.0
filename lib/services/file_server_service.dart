@@ -22,6 +22,7 @@ import 'experiment_report.dart';
 import 'metrics/detection_accuracy.dart';
 import 'metrics/traffic_counter.dart';
 import 'schedulers/scheduler_registry.dart';
+import 'utils/image_variants.dart';
 import 'utils/zip_entry_cache.dart';
 
 /// Manages the HTTP file server for sharing files between devices.
@@ -57,6 +58,19 @@ class FileServerService {
       ),
     ),
   );
+
+  /// Smaller or re-encoded copies of dataset images, per job setting.
+  final ImageVariantCache _imageVariants = ImageVariantCache(
+    () async => Directory(
+      path.join(
+        (await getTemporaryDirectory()).path,
+        'image_variants',
+      ),
+    ),
+  );
+
+  /// How each job's images are served. Configuration: kept across resets.
+  final Map<String, ImageVariant> _jobImageVariant = {};
 
   HttpServer? _server;
   bool _isServerRunning = false;
@@ -380,6 +394,7 @@ class FileServerService {
       _isServerRunning = false;
       _sharedFiles.clear();
       await _zipCache.clear();
+      await _imageVariants.clear();
 
       _logger.log(
         '✅ HTTP file server stopped',
@@ -407,6 +422,7 @@ class FileServerService {
     // file is available.
     _sharedFiles.clear();
     await _zipCache.clear();
+    await _imageVariants.clear();
 
     if (!_isServerRunning) {
       _logger.log(
@@ -558,7 +574,16 @@ class FileServerService {
           );
         }
 
-        final entryFile = File(entry.path);
+        // Served as the job's image setting asks (smaller / re-encoded).
+        final variant =
+            _jobImageVariant[fileId] ?? ImageVariant.original;
+        final entryFile = _isImageName(entry.name)
+            ? await _imageVariants.fileFor(
+                File(entry.path),
+                variant,
+              )
+            : File(entry.path);
+        final entrySize = await entryFile.length();
 
         // Range support for entry bytes.
         final rangeHeader =
@@ -575,10 +600,10 @@ class FileServerService {
           int end = parts.length > 1 &&
                   parts[1].isNotEmpty
               ? int.parse(parts[1])
-              : entry.size - 1;
+              : entrySize - 1;
 
-          if (end >= entry.size) {
-            end = entry.size - 1;
+          if (end >= entrySize) {
+            end = entrySize - 1;
           }
 
           if (start > end) {
@@ -586,7 +611,7 @@ class FileServerService {
               416,
               headers: {
                 'Content-Range':
-                    'bytes */${entry.size}',
+                    'bytes */$entrySize',
               },
             );
           }
@@ -606,7 +631,7 @@ class FileServerService {
               'Content-Length':
                   (end - start + 1).toString(),
               'Content-Range':
-                  'bytes $start-$end/${entry.size}',
+                  'bytes $start-$end/$entrySize',
               'Content-Disposition':
                   'attachment; filename="${entry.name}"',
               'Accept-Ranges': 'bytes',
@@ -627,7 +652,7 @@ class FileServerService {
               ).toLowerCase(),
             ),
             'Content-Length':
-                entry.size.toString(),
+                entrySize.toString(),
             'Content-Disposition':
                 'attachment; filename="${entry.name}"',
             'Accept-Ranges': 'bytes',
@@ -1568,6 +1593,7 @@ class FileServerService {
       datasetName: dataset?.name,
       datasetBytes: dataset?.size,
       datasetUnits: distributionManager.jobProgress(jobId)['total'] ?? 0,
+      imageSetting: (_jobImageVariant[jobId] ?? ImageVariant.original).label,
       schedulerName: '${distributionManager.schedulerName} (${distributionManager.schedulerId})',
       scheduleCalls: distributionManager.scheduleCalls,
       avgScheduleMs: distributionManager.avgScheduleMs,
@@ -2268,6 +2294,28 @@ class FileServerService {
 
       final adaptive = j['adaptive_batch'];
 
+      final maxSide = (j['image_max_side'] as num?)?.toInt();
+      final quality = (j['image_quality'] as num?)?.toInt();
+      final variantGiven = maxSide != null || quality != null;
+
+      if (variantGiven) {
+        final variant = ImageVariant(
+          maxSide: (maxSide ?? 0).clamp(0, 10000),
+          quality: (quality ?? 0).clamp(0, 100),
+        );
+
+        _jobImageVariant[jobId] = variant;
+        MetricsStore.instance.imageSetting = variant.label;
+
+        _logger.log(
+          '⚙️ Images for $jobId served as ${variant.label}',
+        );
+
+        // Converted in the background; a request that comes first waits
+        // for its own image only.
+        unawaited(_applyImageVariant(jobId, variant));
+      }
+
       if (adaptive is bool) {
         _jobAdaptiveBatch[jobId] = adaptive;
 
@@ -2277,7 +2325,7 @@ class FileServerService {
         );
       }
 
-      if (defaultMax > 0 || adaptive is bool) {
+      if (defaultMax > 0 || adaptive is bool || variantGiven) {
         if (defaultMax > 0) {
           _jobDefaultUnits[jobId] =
               defaultMax;
@@ -2483,6 +2531,70 @@ class FileServerService {
       return shelf.Response.internalServerError(
         body: 'error',
       );
+    }
+  }
+
+  static bool _isImageName(String name) {
+    final n = name.toLowerCase();
+
+    return n.endsWith('.jpg') ||
+        n.endsWith('.jpeg') ||
+        n.endsWith('.png') ||
+        n.endsWith('.bmp') ||
+        n.endsWith('.webp');
+  }
+
+  /// Make [jobId]'s images in [variant] ahead of the workers, then tell the
+  /// schedulers the new unit sizes (they estimate transfer time from them).
+  Future<void> _applyImageVariant(
+    String jobId,
+    ImageVariant variant,
+  ) async {
+    final dataset = _sharedFiles[jobId];
+
+    if (dataset == null) return;
+
+    try {
+      final entries = await _zipCache.entries(
+        dataset.id,
+        dataset.file,
+      );
+
+      final byUnit = <int, File>{};
+
+      for (var i = 0;; i++) {
+        final url = distributionManager.getUnitFileUrl(jobId, i);
+
+        if (url == null) break;
+
+        final name = Uri.parse(url).queryParameters['entry'];
+        final entry = name == null ? null : entries[name];
+
+        if (entry != null && _isImageName(entry.name)) {
+          byUnit[i] = File(entry.path);
+        }
+      }
+
+      await _imageVariants.prepare(byUnit.values.toList(), variant);
+
+      final sizes = <int, int>{};
+
+      for (final e in byUnit.entries) {
+        sizes[e.key] =
+            await (await _imageVariants.fileFor(e.value, variant)).length();
+      }
+
+      distributionManager.setUnitSizes(jobId, sizes);
+
+      final before = byUnit.values.fold<int>(0, (a, f) => a + f.lengthSync());
+      final after = sizes.values.fold<int>(0, (a, b) => a + b);
+
+      _logger.log(
+        '🖼️ ${byUnit.length} images ready as ${variant.label}: '
+        '${_formatFileSize(before)} -> ${_formatFileSize(after)}',
+      );
+    } catch (e) {
+      _logger.log('⚠️ Could not prepare images as ${variant.label}: $e');
     }
   }
 

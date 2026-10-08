@@ -49,6 +49,9 @@ class _HostSessionScreenState
   int _unitsPerAssignment = 2;
   // Batch size follows the work left, with _unitsPerAssignment as the cap.
   bool _adaptiveBatch = false;
+  // How the host serves dataset images: 0 = as they are.
+  int _imageMaxSide = 0;
+  int _imageQuality = 0;
   // warmup UI state
   bool _modelWarmupReceived = false;
   double? _modelWarmupTtprocMs;
@@ -797,6 +800,8 @@ class _HostSessionScreenState
           'default_max_units':
               _unitsPerAssignment,
           'adaptive_batch': _adaptiveBatch,
+          'image_max_side': _imageMaxSide,
+          'image_quality': _imageQuality,
         });
         await http.post(
           optsUrl,
@@ -2366,6 +2371,60 @@ class _HostSessionScreenState
                     onChanged: (v) => setState(
                       () => _adaptiveBatch = v,
                     ),
+                  ),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Image size sent',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      DropdownButton<int>(
+                        value: _imageMaxSide,
+                        items: [
+                          for (final v in [0, 1280, 960, 640, 320])
+                            DropdownMenuItem(
+                              value: v,
+                              child: Text(
+                                v == 0 ? 'Original' : 'Max $v px',
+                              ),
+                            ),
+                        ],
+                        onChanged: (v) => setState(
+                          () => _imageMaxSide = v ?? 0,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'JPEG quality',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      DropdownButton<int>(
+                        value: _imageQuality,
+                        items: [
+                          for (final v in [0, 90, 75, 50, 30])
+                            DropdownMenuItem(
+                              value: v,
+                              child: Text(
+                                v == 0 ? 'Original' : '$v',
+                              ),
+                            ),
+                        ],
+                        onChanged: (v) => setState(
+                          () => _imageQuality = v ?? 0,
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(
                     height: 16,

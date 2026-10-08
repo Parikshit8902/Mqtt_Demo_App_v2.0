@@ -372,6 +372,9 @@ class MetricsStore extends ChangeNotifier {
   /// Which scheduling algorithm the host is running (labels exports).
   String schedulerId = '';
 
+  /// How the host serves dataset images (ImageVariant.label).
+  String imageSetting = 'original';
+
   /// Scheduling decisions, newest last (capped).
   final List<DecisionRecord> decisions = [];
   static const int _maxDecisions = 500;
@@ -603,6 +606,7 @@ class MetricsStore extends ChangeNotifier {
     }
     return RunMetrics.compute(
       scheduler: schedulerId,
+      images: imageSetting,
       startMs: experimentStartMs,
       endMs: lastUnitAtMs,
       latencies: latencies,
