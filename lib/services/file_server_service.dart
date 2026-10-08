@@ -3,13 +3,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
 import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:uuid/uuid.dart';
-import 'package:archive/archive.dart';
 
 import 'message_logger.dart';
+import 'distribution_manager.dart' show UnitFailureOutcome;
 import 'distribution_singleton.dart';
 import 'models/result_dto.dart';
 import 'models/assignment.dart';
@@ -18,6 +19,7 @@ import 'metrics/metrics_store.dart';
 import 'experiment_report.dart';
 import 'metrics/traffic_counter.dart';
 import 'schedulers/scheduler_registry.dart';
+import 'utils/zip_entry_cache.dart';
 
 /// Manages the HTTP file server for sharing files between devices.
 ///
@@ -29,6 +31,17 @@ class FileServerService {
   final MessageLogger _logger;
   final Function()? _onStateChanged;
   final Map<String, _SharedFile> _sharedFiles = {};
+
+  /// Shared ZIPs extracted once, so serving an image is a file read rather
+  /// than a full decode of the dataset on every request.
+  final ZipEntryCache _zipCache = ZipEntryCache(
+    () async => Directory(
+      path.join(
+        (await getTemporaryDirectory()).path,
+        'zip_entry_cache',
+      ),
+    ),
+  );
 
   HttpServer? _server;
   bool _isServerRunning = false;
@@ -323,6 +336,7 @@ class FileServerService {
 
       _isServerRunning = false;
       _sharedFiles.clear();
+      await _zipCache.clear();
 
       _logger.log(
         '✅ HTTP file server stopped',
@@ -349,6 +363,7 @@ class FileServerService {
     // Clear previous shared files so only the latest
     // file is available.
     _sharedFiles.clear();
+    await _zipCache.clear();
 
     if (!_isServerRunning) {
       _logger.log(
@@ -482,23 +497,14 @@ class FileServerService {
         final entryName =
             Uri.decodeComponent(entryParam);
 
-        final bytes =
-            await file.readAsBytes();
-
-        final archive =
-            ZipDecoder().decodeBytes(bytes);
-
-        final af = archive.files.firstWhere(
-          (f) => f.name == entryName,
-          orElse: () => ArchiveFile(
-            '',
-            0,
-            null,
-          ),
+        // Extracted once per shared file; later requests read from disk.
+        final entry = await _zipCache.entry(
+          fileId,
+          file,
+          entryName,
         );
 
-        if (af.name.isEmpty ||
-            af.content == null) {
+        if (entry == null) {
           _logger.log(
             '❌ Entry not found in archive: '
             '$entryName',
@@ -509,8 +515,7 @@ class FileServerService {
           );
         }
 
-        final entryBytes =
-            af.content as List<int>;
+        final entryFile = File(entry.path);
 
         // Range support for entry bytes.
         final rangeHeader =
@@ -527,35 +532,40 @@ class FileServerService {
           int end = parts.length > 1 &&
                   parts[1].isNotEmpty
               ? int.parse(parts[1])
-              : entryBytes.length - 1;
+              : entry.size - 1;
 
-          if (end >= entryBytes.length) {
-            end = entryBytes.length - 1;
+          if (end >= entry.size) {
+            end = entry.size - 1;
           }
 
-          final chunk =
-              entryBytes.sublist(
-            start,
-            end + 1,
-          );
+          if (start > end) {
+            return shelf.Response(
+              416,
+              headers: {
+                'Content-Range':
+                    'bytes */${entry.size}',
+              },
+            );
+          }
 
           return shelf.Response(
             206,
-            body: Stream.fromIterable([
-              chunk,
-            ]),
+            body: entryFile.openRead(
+              start,
+              end + 1,
+            ),
             headers: {
               'Content-Type': _getMimeType(
                 path.extension(
-                  af.name,
+                  entry.name,
                 ).toLowerCase(),
               ),
               'Content-Length':
-                  chunk.length.toString(),
+                  (end - start + 1).toString(),
               'Content-Range':
-                  'bytes $start-$end/${entryBytes.length}',
+                  'bytes $start-$end/${entry.size}',
               'Content-Disposition':
-                  'attachment; filename="${af.name}"',
+                  'attachment; filename="${entry.name}"',
               'Accept-Ranges': 'bytes',
               'Cache-Control':
                   'no-cache, no-store, must-revalidate',
@@ -566,19 +576,17 @@ class FileServerService {
         }
 
         return shelf.Response.ok(
-          Stream.fromIterable([
-            entryBytes,
-          ]),
+          entryFile.openRead(),
           headers: {
             'Content-Type': _getMimeType(
               path.extension(
-                af.name,
+                entry.name,
               ).toLowerCase(),
             ),
             'Content-Length':
-                entryBytes.length.toString(),
+                entry.size.toString(),
             'Content-Disposition':
-                'attachment; filename="${af.name}"',
+                'attachment; filename="${entry.name}"',
             'Accept-Ranges': 'bytes',
             'Cache-Control':
                 'no-cache, no-store, must-revalidate',
@@ -895,19 +903,21 @@ class FileServerService {
                       .toLowerCase()
                       .endsWith('.zip')) {
                 try {
-                  final bytes =
-                      await datasetFile.file
-                          .readAsBytes();
-
-                  final archive =
-                      ZipDecoder().decodeBytes(
-                    bytes,
+                  // Extracting here, before any worker asks, keeps the
+                  // one-off extraction out of the measured download times.
+                  final entries =
+                      await _zipCache.entries(
+                    datasetFile.id,
+                    datasetFile.file,
                   );
 
                   final imageFiles =
-                      archive.files.where(
+                      entries.values.where(
                     (f) =>
-                        f.isFile &&
+                        // macOS adds "__MACOSX/._name.jpg" metadata files
+                        // that are not images and would only fail.
+                        !f.name.startsWith('__MACOSX/') &&
+                        !path.basename(f.name).startsWith('._') &&
                         (f.name
                                 .toLowerCase()
                                 .endsWith('.jpg') ||
@@ -2219,6 +2229,10 @@ class FileServerService {
       final rr =
           ResultReport.fromJson(j);
 
+      if (rr.failed) {
+        return _handleFailedUnit(jobId, rr);
+      }
+
       // Mark unit complete, then fold the report (estimate, latency and the
       // health the phone attached) into that client's live state.
       distributionManager.markUnitComplete(
@@ -2348,6 +2362,72 @@ class FileServerService {
         body: 'error',
       );
     }
+  }
+
+  /// A worker could not process a unit. It goes back to the pool at once and
+  /// is left out of the unit records and recent results, so it never counts
+  /// as a completed image with no detections.
+  shelf.Response _handleFailedUnit(
+    String jobId,
+    ResultReport rr,
+  ) {
+    final outcome =
+        distributionManager.markUnitFailed(
+      jobId,
+      rr.unitIndex,
+      rr.clientId,
+    );
+
+    final health = rr.health;
+
+    if (health != null) {
+      distributionManager.updateClientHealth(
+        rr.clientId,
+        health,
+      );
+    }
+
+    final what = switch (outcome) {
+      UnitFailureOutcome.requeued => 're-queued',
+      UnitFailureOutcome.abandoned =>
+        'given up after '
+            '${distributionManager.maxUnitAttempts} failures',
+      UnitFailureOutcome.ignored =>
+        'already done or held by another phone',
+    };
+
+    _logger.log(
+      '↩️ Unit ${rr.unitIndex} of job $jobId '
+      'failed on ${rr.clientId}: ${rr.error} ($what)',
+    );
+
+    _schedulerLogs.insert(
+      0,
+      {
+        'time':
+            DateTime.now().toIso8601String(),
+        'type': 'failure',
+        'job': jobId,
+        'unit': rr.unitIndex,
+        'client': rr.clientId,
+        'error': rr.error,
+        'outcome': outcome.name,
+      },
+    );
+
+    if (_schedulerLogs.length > 50) {
+      _schedulerLogs.removeLast();
+    }
+
+    return shelf.Response.ok(
+      jsonEncode({
+        'status': 'ok',
+        'outcome': outcome.name,
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    );
   }
 
   // ---------------------------------------------------------------------------

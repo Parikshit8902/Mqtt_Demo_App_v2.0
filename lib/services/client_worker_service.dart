@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
 import 'message_logger.dart';
 import 'assignments_client.dart';
+import 'models/assignment.dart';
 import 'models/result_dto.dart';
 import 'inference_service.dart';
 import 'utils/metrics.dart';
@@ -76,11 +77,15 @@ class ClientWorkerService extends ChangeNotifier {
               TrafficCounter.instance.countRxMsg(TrafficChannel.httpData); // the image response
               // Run inference on bytes
               final sw = Stopwatch()..start();
-              Map<String, dynamic> inferRes = {};
+              final Map<String, dynamic> inferRes;
               try {
                 inferRes = await _inferenceService.predict(bytes);
               } catch (e) {
+                // Not a result: an empty detection list would count as a
+                // completed unit and skew both accuracy and timing.
                 _logger.log('⚠️ Inference error for unit ${unit.unitIndex}: $e');
+                await _reportFailure(unit, 'inference: $e');
+                continue;
               }
               sw.stop();
               final ttMs = sw.elapsedMilliseconds;
@@ -125,9 +130,11 @@ class ClientWorkerService extends ChangeNotifier {
               }
             } else {
               _logger.log('❌ Failed to download unit ${unit.unitIndex}: ${streamed.statusCode}');
+              await _reportFailure(unit, 'download: HTTP ${streamed.statusCode}');
             }
           } catch (e) {
             _logger.log('❌ Error downloading/processing unit ${unit.unitIndex}: $e');
+            await _reportFailure(unit, 'download or processing: $e');
           }
         }
       } catch (e) {
@@ -138,6 +145,29 @@ class ClientWorkerService extends ChangeNotifier {
 
     _logger.log('🛑 Client worker stopped');
     notifyListeners();
+  }
+
+  /// Tell the host this unit could not be processed, so it goes back to the
+  /// pool now instead of after its lease runs out. Nothing is recorded as a
+  /// finished unit, so the failure stays out of timing and accuracy. If the
+  /// host cannot be reached either, the lease still reclaims the unit.
+  Future<void> _reportFailure(Unit unit, String reason) async {
+    final error = reason.length > 200 ? reason.substring(0, 200) : reason;
+    final ok = await _assignClient.postResult(ResultReport(
+      jobId: jobId,
+      clientId: clientId,
+      unitIndex: unit.unitIndex,
+      ttprocMs: 0,
+      bandwidthKbps: 0,
+      error: error,
+      health: PerformanceService.instance.currentHealth,
+    ));
+    _logger.log(ok
+        ? '↩️ Reported unit ${unit.unitIndex} as failed ($error)'
+        : '⚠️ Could not report unit ${unit.unitIndex} as failed; the host re-queues it when its lease expires');
+    // Keeps a phone whose model or link is broken from spinning through the
+    // queue; the host stops giving it work after a few failures.
+    await Future.delayed(const Duration(seconds: 1));
   }
 
   /// Upload this phone's full recording (2 s samples, per-unit records, traffic

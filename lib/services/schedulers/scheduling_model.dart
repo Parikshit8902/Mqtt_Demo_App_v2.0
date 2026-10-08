@@ -27,7 +27,8 @@ class SchedulingConfig {
   /// With the OS low-memory flag set and less than this free, no new work.
   final double minMemFreeMb;
 
-  /// This many recent lease expiries on a phone take it out of rotation.
+  /// This many recently failed units (lease expiries or reported errors) on a
+  /// phone take it out of rotation.
   final int gateFailures;
 
   /// DetectNet uses `latency / 500 ms` and `pending / 5` as objective terms.
@@ -101,7 +102,8 @@ class HealthPolicy {
     return 0.5 + 0.5 * (rssiDbm + 85) / 25.0;
   }
 
-  /// Each recent lease expiry makes a phone look less reliable.
+  /// Each recently failed unit (lease expiry or reported error) makes a phone
+  /// look less reliable.
   static double failureFactor(int failures) => 1.0 / (1.0 + 0.5 * max(0, failures));
 
   /// Combined compute capacity (thermal x battery x memory x reliability).
@@ -130,7 +132,7 @@ class HealthPolicy {
     if (h.batteryPct != null && h.charging != true && h.batteryPct! <= cfg.minBatteryPct) return 'battery ${h.batteryPct}%';
     if (h.thermalStatus != null && h.thermalStatus! >= cfg.gateThermalStatus) return 'thermal ${h.thermalStatus}';
     if (h.lowMemory == true && (h.memFreeMb == null || h.memFreeMb! < cfg.minMemFreeMb)) return 'low memory';
-    if (c.failures >= cfg.gateFailures) return '${c.failures} timeouts';
+    if (c.failures >= cfg.gateFailures) return '${c.failures} failed units';
     return null;
   }
 }

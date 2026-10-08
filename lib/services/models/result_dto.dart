@@ -17,6 +17,13 @@ class ResultReport {
   /// sample). Null from older clients.
   final DeviceHealth? health;
 
+  /// Set when the phone could not process the unit (download or inference
+  /// failed). A failed report carries no detections or timings; the host puts
+  /// the unit back in the pool instead of counting it as completed.
+  final String? error;
+
+  bool get failed => error != null;
+
   ResultReport({
     required this.jobId,
     required this.clientId,
@@ -30,6 +37,7 @@ class ResultReport {
     this.resultUri,
     this.warmup = false,
     this.health,
+    this.error,
   });
 
   Map<String, dynamic> toJson() => {
@@ -45,6 +53,7 @@ class ResultReport {
         'result_uri': resultUri,
         'warmup': warmup,
         if (health != null && !health!.isUnknown) 'health': health!.toWire(),
+        if (error != null) 'error': error,
       };
 
   static ResultReport fromJson(Map<String, dynamic> j) => ResultReport(
@@ -62,6 +71,7 @@ class ResultReport {
         health: j['health'] is Map
             ? DeviceHealth.fromWire(Map<String, dynamic>.from(j['health'] as Map))
             : null,
+        error: j['error'] as String?,
       );
 }
 
@@ -88,7 +98,8 @@ class ClientEstimate {
   /// Milliseconds since the host last heard from this client; -1 = unknown.
   int ageMs;
 
-  /// Recent units that timed out on this client and had to be re-queued.
+  /// Recent units this client failed (lease timed out or it reported an error)
+  /// that had to be re-queued.
   int failures;
 
   /// Device model name (from the client id), used for power priors.

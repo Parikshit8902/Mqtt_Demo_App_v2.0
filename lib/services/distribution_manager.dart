@@ -21,14 +21,18 @@ class DistributionManager {
   /// starve the phone that is actually asking for work.
   final int activeWindowMs;
 
+  /// A unit that phones report as failed this many times is given up on
+  /// (status 'failed'), so one corrupt image cannot keep a job from finishing.
+  final int maxUnitAttempts;
+
   /// Optional sink for notable events (a unit reclaimed after its lease
   /// expired). The file server points it at the host log.
   void Function(String message)? onLog;
 
   final int Function() _nowMs;
 
-  // Size of the per-client latency window, and how far back a lease expiry
-  // still counts as a recent failure.
+  // Size of the per-client latency window, and how far back a failed unit
+  // (lease expiry or reported error) still counts as a recent failure.
   static const int _latencyWindow = 5;
   static const int _failureWindowMs = 5 * 60 * 1000;
 
@@ -42,6 +46,7 @@ class DistributionManager {
     int Function()? nowMs,
     this.leaseMs = 60000,
     this.activeWindowMs = 30000,
+    this.maxUnitAttempts = 3,
   })  : _nowMs = nowMs ?? _wallClockMs,
         _scheduler =
             SchedulerFactory.create(
@@ -141,7 +146,7 @@ class DistributionManager {
   final Map<String, List<Unit>> _jobs = {};
 
   // jobId -> unitIndex -> status:
-  // 'available'|'assigned'|'completed'
+  // 'available'|'assigned'|'completed'|'failed'
   final Map<String, Map<int, String>> _unitStatus = {};
 
   // clientId -> estimate
@@ -155,6 +160,10 @@ class DistributionManager {
 
   // jobId -> unitIndex -> who holds the unit and since when
   final Map<String, Map<int, _Lease>> _leases = {};
+
+  // jobId -> unitIndex -> how many times phones reported it failed, this
+  // experiment
+  final Map<String, Map<int, int>> _failureReports = {};
 
   // Jobs that have been reset and must not issue new
   // assignments until the next experiment activates them.
@@ -204,6 +213,7 @@ class DistributionManager {
   /// - unit status
   /// - client assignment queues
   /// - outstanding unit leases
+  /// - failed-unit counts
   ///
   /// Jobs are marked inactive until the next experiment
   /// explicitly activates them.
@@ -222,6 +232,7 @@ class DistributionManager {
 
     // Nothing is assigned any more, so nothing can time out.
     _leases.clear();
+    _failureReports.clear();
 
     // Prevent clients from receiving assignments until
     // the next experiment starts.
@@ -526,6 +537,70 @@ class DistributionManager {
     );
   }
 
+  /// A phone reported that it could not process a unit (its download or
+  /// inference failed). The unit goes straight back to the pool instead of
+  /// waiting out its lease, and it counts as a recent failure for that phone,
+  /// like a lease expiry, so a phone that keeps failing stops getting work.
+  ///
+  /// After [maxUnitAttempts] reports for the same unit it is given up on
+  /// (status 'failed'): the image itself is probably bad, and retrying it
+  /// forever would keep the job from finishing. A late success still
+  /// completes it.
+  ///
+  /// A report for a unit that has completed in the meantime, or that is now
+  /// held by another phone, only drops the unit from the reporter's queue.
+  UnitFailureOutcome markUnitFailed(
+    String jobId,
+    int unitIndex,
+    String clientId,
+  ) {
+    final statusMap =
+        _unitStatus[jobId];
+
+    if (statusMap == null) {
+      return UnitFailureOutcome.ignored;
+    }
+
+    touchClient(clientId);
+
+    _clientQueues[clientId]?.removeWhere(
+      (u) => u.unitIndex == unitIndex,
+    );
+
+    final lease =
+        _leases[jobId]?[unitIndex];
+
+    if (statusMap[unitIndex] != 'assigned' ||
+        (lease != null &&
+            lease.clientId != clientId)) {
+      return UnitFailureOutcome.ignored;
+    }
+
+    _leases[jobId]?.remove(unitIndex);
+
+    _clientStates[clientId]
+        ?.recordFailure(_nowMs());
+
+    final reports = _failureReports.putIfAbsent(
+      jobId,
+      () => {},
+    );
+
+    final attempts =
+        (reports[unitIndex] ?? 0) + 1;
+
+    reports[unitIndex] = attempts;
+
+    if (attempts >= maxUnitAttempts) {
+      statusMap[unitIndex] = 'failed';
+      return UnitFailureOutcome.abandoned;
+    }
+
+    statusMap[unitIndex] = 'available';
+
+    return UnitFailureOutcome.requeued;
+  }
+
   /// Hand back every unit of [jobId] that has been assigned for longer than
   /// [leaseMs] without a result, so it can go to any phone. Each reclaimed
   /// unit leaves its holder's queue and counts as a failure for that phone.
@@ -565,7 +640,7 @@ class DistributionManager {
       );
 
       _clientStates[lease.clientId]
-          ?.recordExpiry(now);
+          ?.recordFailure(now);
 
       reclaimedByClient[lease.clientId] =
           (reclaimedByClient[lease.clientId] ??
@@ -751,6 +826,8 @@ class DistributionManager {
         'completed': 0,
         'assigned': 0,
         'available': 0,
+        'failed': 0,
+        'failure_reports': 0,
       };
     }
 
@@ -779,6 +856,17 @@ class DistributionManager {
       'completed': completed,
       'assigned': assigned,
       'available': available,
+      // Units given up on after repeated failures.
+      'failed': status.values
+          .where(
+            (v) => v == 'failed',
+          )
+          .length,
+      // Every failure report this experiment, including retried units.
+      'failure_reports':
+          (_failureReports[jobId] ?? const {})
+              .values
+              .fold<int>(0, (a, b) => a + b),
     };
   }
 
@@ -816,6 +904,18 @@ class DistributionManager {
   }
 }
 
+/// What [DistributionManager.markUnitFailed] did with a failure report.
+enum UnitFailureOutcome {
+  /// Back in the pool for any phone.
+  requeued,
+
+  /// Failed too many times; left out of the job.
+  abandoned,
+
+  /// Already completed, given up on, or held by another phone.
+  ignored,
+}
+
 /// A unit handed to a client and not yet reported back.
 class _Lease {
   final String clientId;
@@ -833,8 +933,9 @@ class _ClientState {
   /// Total ms (download + inference) of the last few finished units.
   final List<int> latenciesMs = [];
 
-  /// When this client's leases expired, oldest first.
-  final List<int> _expiriesMs = [];
+  /// When this client failed a unit (lease expired or it reported an error),
+  /// oldest first.
+  final List<int> _failuresMs = [];
 
   _ClientState({
     required this.deviceName,
@@ -851,18 +952,18 @@ class _ClientState {
               ) /
               latenciesMs.length;
 
-  void recordExpiry(int now) {
-    _expiriesMs.removeWhere(
+  void recordFailure(int now) {
+    _failuresMs.removeWhere(
       (t) =>
           now - t >
           DistributionManager._failureWindowMs,
     );
-    _expiriesMs.add(now);
+    _failuresMs.add(now);
   }
 
-  /// Lease expiries within the recent failure window.
+  /// Failures within the recent failure window.
   int failuresAt(int now) {
-    return _expiriesMs
+    return _failuresMs
         .where(
           (t) =>
               now - t <=
