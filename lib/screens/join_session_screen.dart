@@ -24,6 +24,7 @@ class JoinSessionScreen extends StatefulWidget {
 
 class _JoinSessionScreenState extends State<JoinSessionScreen> {
   final TextEditingController _brokerIpController = TextEditingController();
+  final TextEditingController _pinController = TextEditingController();
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final BrokerDiscoveryService _discoveryService = BrokerDiscoveryService();
@@ -44,6 +45,7 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
   void dispose() {
     widget.mqttService.removeListener(_onMqttServiceChanged);
     _brokerIpController.dispose();
+    _pinController.dispose();
     _messageController.dispose();
     _scrollController.dispose();
     _discoveryService.dispose();
@@ -92,7 +94,7 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
       return;
     }
 
-    final success = await widget.mqttService.connect(brokerIp);
+    final success = await widget.mqttService.connect(brokerIp, pin: _pinController.text);
     
     setState(() {
       _isConnecting = false;
@@ -106,7 +108,7 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
       await widget.mqttService.subscribe();
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to connect to session')),
+        const SnackBar(content: Text('Failed to connect to session. Check the PIN shown on the host and that both phones are on the same Wi-Fi.')),
       );
     }
   }
@@ -228,6 +230,17 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
                 children: [
                   const Divider(height: 1),
                   const SizedBox(height: 20),
+                  TextField(
+                    controller: _pinController,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    decoration: const InputDecoration(
+                      labelText: 'Session PIN',
+                      helperText: 'Shown on the host phone',
+                      counterText: '',
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   Text(
                     'Available Sessions',
                     style: Theme.of(context).textTheme.titleLarge,

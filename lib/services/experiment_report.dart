@@ -1,4 +1,6 @@
+import 'metrics/detection_accuracy.dart';
 import 'metrics/metrics_store.dart';
+import 'metrics/run_metrics.dart';
 import 'metrics/traffic_counter.dart';
 
 /// One phone's row in the experiment report.
@@ -26,8 +28,9 @@ class ReportDevice {
 ///
 /// Sections, in order: experiment (file name, date/time), model, dataset,
 /// scheduling algorithm, number of clients, client table (name, IP, images
-/// processed), compute and network metrics, and per-device message/packet
-/// counts split into data and control for the network-overhead calculation.
+/// processed), compute and network metrics, per-device message/packet
+/// counts split into data and control for the network-overhead calculation,
+/// and the run's comparison metrics next to earlier runs.
 String buildExperimentReport({
   required String fileName,
   required DateTime generatedAt,
@@ -40,6 +43,9 @@ String buildExperimentReport({
   int scheduleCalls = 0,
   double avgScheduleMs = 0,
   required List<ReportDevice> devices,
+  RunMetrics? run,
+  List<RunMetrics> previousRuns = const [],
+  AccuracyResult? accuracy,
 }) {
   final b = StringBuffer();
   final clients = devices.where((d) => !d.isMaster).toList();
@@ -180,6 +186,58 @@ String buildExperimentReport({
   b.writeln();
   b.writeln('n/a = not available: a worker uploads its message counts every 30 s while it works and when it finishes,');
   b.writeln('so a device that has not reported yet shows n/a. The master\'s on-wire figures include MQTT traffic it relays for the clients.');
+
+  title('9. RUN METRICS (for comparing runs)');
+  if (run == null || run.units == 0) {
+    b.writeln('No finished images yet.');
+  } else {
+    b.writeln('Makespan          : ${run.makespanS.toStringAsFixed(1)} s (first assignment to last result, host clock)');
+    b.writeln('Throughput        : ${run.throughput.toStringAsFixed(3)} images/s (${run.units} images, ${run.phones} phones)');
+    b.writeln('Latency per image : mean ${run.meanLatencyMs.toStringAsFixed(0)} ms, '
+        'p50 ${run.p50LatencyMs.toStringAsFixed(0)} ms, p95 ${run.p95LatencyMs.toStringAsFixed(0)} ms (download + inference)');
+    b.writeln('Load balance      : Jain ${run.jainUnits.toStringAsFixed(3)} over images per phone, '
+        '${run.jainBusy.toStringAsFixed(3)} over busy time (1 = even)');
+    b.writeln('Energy per image  : ${run.energyPerImageJ == null ? 'n/a' : '${run.energyPerImageJ!.toStringAsFixed(2)} J'} '
+        '(modelled, all phones incl. host, over each recording)');
+  }
+  if (previousRuns.isNotEmpty) {
+    b.writeln();
+    b.writeln('Earlier runs since the app started (oldest first):');
+    final head = ['Run', 'Scheduler', 'Makespan s', 'Images/s', 'p50 ms', 'p95 ms', 'Jain', 'J/image'];
+    final table = <List<String>>[
+      for (var i = 0; i < previousRuns.length; i++)
+        [
+          '${i + 1}',
+          previousRuns[i].scheduler,
+          previousRuns[i].makespanS.toStringAsFixed(1),
+          previousRuns[i].throughput.toStringAsFixed(3),
+          previousRuns[i].p50LatencyMs.toStringAsFixed(0),
+          previousRuns[i].p95LatencyMs.toStringAsFixed(0),
+          previousRuns[i].jainUnits.toStringAsFixed(3),
+          previousRuns[i].energyPerImageJ?.toStringAsFixed(2) ?? 'n/a',
+        ],
+    ];
+    final w = [for (var i = 0; i < head.length; i++) _width(table.map((r) => r[i]), head[i])];
+    String row(List<String> c) => [for (var i = 0; i < c.length; i++) i < 2 ? c[i].padRight(w[i]) : c[i].padLeft(w[i])].join('  ');
+    b.writeln(row(head));
+    for (final r in table) {
+      b.writeln(row(r));
+    }
+  }
+
+  title('10. ACCURACY (against labels in the dataset)');
+  if (accuracy == null) {
+    b.writeln('Not scored: the dataset ZIP has no YOLO label files for the finished images.');
+  } else {
+    b.writeln('Images scored : ${accuracy.images} (labelled boxes ${accuracy.labelledBoxes}, detections ${accuracy.detectedBoxes})');
+    b.writeln('mAP@0.5       : ${accuracy.map50.toStringAsFixed(3)}');
+    b.writeln('Precision     : ${accuracy.precision.toStringAsFixed(3)}');
+    b.writeln('Recall        : ${accuracy.recall.toStringAsFixed(3)}');
+    final classes = accuracy.apByClass.entries.toList()..sort((a, c) => a.key.compareTo(c.key));
+    for (final e in classes) {
+      b.writeln('  AP ${e.key.padRight(16)} ${e.value.toStringAsFixed(3)}');
+    }
+  }
   return b.toString();
 }
 

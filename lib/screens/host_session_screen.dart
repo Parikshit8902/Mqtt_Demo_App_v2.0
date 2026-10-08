@@ -47,6 +47,8 @@ class _HostSessionScreenState
   File? _selectedModelFile;
   File? _selectedDatasetFile;
   int _unitsPerAssignment = 2;
+  // Batch size follows the work left, with _unitsPerAssignment as the cap.
+  bool _adaptiveBatch = false;
   // warmup UI state
   bool _modelWarmupReceived = false;
   double? _modelWarmupTtprocMs;
@@ -794,6 +796,7 @@ class _HostSessionScreenState
           'job_id': jobId,
           'default_max_units':
               _unitsPerAssignment,
+          'adaptive_batch': _adaptiveBatch,
         });
         await http.post(
           optsUrl,
@@ -1883,29 +1886,60 @@ class _HostSessionScreenState
                             widget.mqttService
                                 .isBrokerRunning
                           )
-                            const Row(
+                            Column(
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.start,
                               children: [
-                                Icon(
-                                  Icons.circle,
-                                  color:
-                                      Colors.green,
-                                  size: 12,
+                                const Row(
+                                  children: [
+                                    Icon(
+                                      Icons.circle,
+                                      color:
+                                          Colors.green,
+                                      size: 12,
+                                    ),
+                                    SizedBox(
+                                      width: 8,
+                                    ),
+                                    Text(
+                                      'Session is live',
+                                      style:
+                                          TextStyle(
+                                        color:
+                                            Colors.green,
+                                        fontSize: 14,
+                                        fontWeight:
+                                            FontWeight
+                                                .w500,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                SizedBox(
-                                  width: 8,
-                                ),
-                                Text(
-                                  'Session is live',
-                                  style:
-                                      TextStyle(
-                                    color:
-                                        Colors.green,
-                                    fontSize: 14,
-                                    fontWeight:
-                                        FontWeight
-                                            .w500,
+                                if (widget.mqttService
+                                        .sessionPin !=
+                                    null) ...[
+                                  const SizedBox(
+                                    height: 8,
                                   ),
-                                ),
+                                  SelectableText(
+                                    'PIN  ${widget.mqttService.sessionPin}',
+                                    style:
+                                        const TextStyle(
+                                      fontSize: 20,
+                                      fontWeight:
+                                          FontWeight.w700,
+                                      letterSpacing: 2,
+                                    ),
+                                  ),
+                                  Text(
+                                    'Participants enter this PIN to join',
+                                    style: TextStyle(
+                                      color: Colors
+                                          .grey.shade600,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
                               ],
                             )
                           else
@@ -2315,6 +2349,23 @@ class _HostSessionScreenState
                         ),
                       ),
                     ],
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text(
+                      'Adaptive batch size',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    subtitle: const Text(
+                      'Large batches while plenty is left, down to 1 near the end. '
+                      'Units per assignment becomes the maximum.',
+                    ),
+                    value: _adaptiveBatch,
+                    onChanged: (v) => setState(
+                      () => _adaptiveBatch = v,
+                    ),
                   ),
                   const SizedBox(
                     height: 16,

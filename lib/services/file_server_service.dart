@@ -15,8 +15,10 @@ import 'distribution_singleton.dart';
 import 'models/result_dto.dart';
 import 'models/assignment.dart';
 import 'network_helper.dart';
+import 'session_auth.dart';
 import 'metrics/metrics_store.dart';
 import 'experiment_report.dart';
+import 'metrics/detection_accuracy.dart';
 import 'metrics/traffic_counter.dart';
 import 'schedulers/scheduler_registry.dart';
 import 'utils/zip_entry_cache.dart';
@@ -31,6 +33,13 @@ class FileServerService {
   final MessageLogger _logger;
   final Function()? _onStateChanged;
   final Map<String, _SharedFile> _sharedFiles = {};
+
+  /// When set, other phones must send this PIN (SessionAuth.header, or a
+  /// `pin` query parameter) to reach `/admin/*`, `/assignments/*` and the
+  /// file list. Requests from this phone itself are always allowed, so the
+  /// host's own screens need no PIN. Individual file links stay open: their
+  /// ids are random and only announced over the PIN-protected broker.
+  String? requiredPin;
 
   /// Called with a job id when that job has units to hand out (it was just
   /// registered, or a failed unit went back to the pool), so the host can
@@ -98,11 +107,20 @@ class FileServerService {
   final Map<String, List<Map<String, dynamic>>>
       _resultReportsByJob = {};
 
+  /// Every finished unit's detections, for scoring against labels.
+  ///
+  /// Keyed by job id, then unit index; reset with the experiment.
+  final Map<String, Map<int, List<dynamic>>> _detectionsByJob = {};
+
   /// Per-job default units to assign when clients request next.
   ///
   /// This is considered configuration rather than experiment-result state,
   /// therefore it is preserved when an experiment is reset.
   final Map<String, int> _jobDefaultUnits = {};
+
+  /// Jobs whose batch size adapts to the work left (see
+  /// DistributionManager.adaptiveBatchSize). Configuration, like the above.
+  final Map<String, bool> _jobAdaptiveBatch = {};
 
   // ---------------------------------------------------------------------------
   // SERVER MANAGEMENT
@@ -215,6 +233,12 @@ class FileServerService {
         _handleMetricsCsv,
       );
 
+      // Detection accuracy against YOLO labels shipped in the dataset ZIP.
+      router.get(
+        '/admin/accuracy',
+        _handleAccuracy,
+      );
+
       // Scheduling algorithm selection (also settable from the host UI).
       router.get(
         '/admin/scheduler',
@@ -260,6 +284,7 @@ class FileServerService {
       final handler = shelf.Pipeline()
           .addMiddleware(logMiddleware)
           .addMiddleware(_trafficMiddleware())
+          .addMiddleware(_pinMiddleware())
           .addHandler(router.call);
 
       _logger.log(
@@ -1298,6 +1323,7 @@ class FileServerService {
       // Clear experiment-specific server state.
       _schedulerLogs.clear();
       _resultReportsByJob.clear();
+      _detectionsByJob.clear();
       MetricsStore.instance.clear();
 
       _logger.log(
@@ -1466,6 +1492,7 @@ class FileServerService {
   String _buildReport({
     required String fileName,
     required DateTime generatedAt,
+    AccuracyResult? accuracy,
   }) {
     final store = MetricsStore.instance;
     final jobId = _currentJobId();
@@ -1522,6 +1549,9 @@ class FileServerService {
       scheduleCalls: distributionManager.scheduleCalls,
       avgScheduleMs: distributionManager.avgScheduleMs,
       devices: devices,
+      run: store.runMetrics(),
+      previousRuns: store.runHistory,
+      accuracy: accuracy,
     );
   }
 
@@ -1557,6 +1587,7 @@ class FileServerService {
           request.url.queryParameters['name'],
         ),
         generatedAt: generatedAt,
+        accuracy: await _accuracyFor(_currentJobId()),
       ));
 
       buffer.writeln();
@@ -2013,6 +2044,15 @@ class FileServerService {
       distributionManager.touchClient(clientId);
       MetricsStore.instance.recordPoll(deviceKeyFromClientId(clientId));
 
+      // With adaptive batching the configured size is only the cap.
+      if (_jobAdaptiveBatch[jobId] == true) {
+        maxUnits = distributionManager.adaptiveBatchSize(
+          jobId,
+          maxUnits,
+          clientId,
+        );
+      }
+
       final units =
           distributionManager.assignNext(
         jobId,
@@ -2180,14 +2220,27 @@ class FileServerService {
                   ) ??
                   0;
 
-      if (defaultMax > 0) {
-        _jobDefaultUnits[jobId] =
-            defaultMax;
+      final adaptive = j['adaptive_batch'];
+
+      if (adaptive is bool) {
+        _jobAdaptiveBatch[jobId] = adaptive;
 
         _logger.log(
-          '⚙️ Set default_max_units for '
-          '$jobId -> $defaultMax',
+          '⚙️ Set adaptive_batch for '
+          '$jobId -> $adaptive',
         );
+      }
+
+      if (defaultMax > 0 || adaptive is bool) {
+        if (defaultMax > 0) {
+          _jobDefaultUnits[jobId] =
+              defaultMax;
+
+          _logger.log(
+            '⚙️ Set default_max_units for '
+            '$jobId -> $defaultMax',
+          );
+        }
 
         return shelf.Response.ok(
           jsonEncode({
@@ -2248,6 +2301,11 @@ class FileServerService {
       );
 
       distributionManager.recordResult(rr);
+
+      _detectionsByJob.putIfAbsent(
+        jobId,
+        () => {},
+      )[rr.unitIndex] = rr.detections ?? const [];
 
       _logger.log(
         '✅ Result received for job '
@@ -2371,6 +2429,124 @@ class FileServerService {
     }
   }
 
+  /// Precision, recall and mAP@0.5 of [jobId]'s finished images against the
+  /// YOLO label files in its dataset ZIP, or null when there is nothing to
+  /// score (no ZIP, no labels, or no finished labelled image).
+  ///
+  /// A label is found next to its image under `labels/` instead of
+  /// `images/` (the YOLO layout), or beside it, as `<name>.txt`. Class names
+  /// come from `classes.txt`, a `*.names` file or `data.yaml` in the ZIP,
+  /// otherwise the COCO names the stock YOLO models use.
+  Future<AccuracyResult?> _accuracyFor(String jobId) async {
+    final dataset = _sharedFiles[jobId];
+    final detections = _detectionsByJob[jobId];
+
+    if (dataset == null ||
+        detections == null ||
+        detections.isEmpty ||
+        !(dataset.mimeType == 'application/zip' ||
+            dataset.name.toLowerCase().endsWith('.zip'))) {
+      return null;
+    }
+
+    try {
+      final entries = await _zipCache.entries(
+        dataset.id,
+        dataset.file,
+      );
+
+      Future<String?> read(String name) async {
+        final e = entries[name];
+        return e == null ? null : File(e.path).readAsString();
+      }
+
+      var names = DetectionAccuracy.cocoNames;
+
+      for (final e in entries.values) {
+        final base = path.posix.basename(e.name).toLowerCase();
+
+        if (base == 'classes.txt' || base.endsWith('.names')) {
+          names = DetectionAccuracy.parseNamesFile(
+            (await read(e.name))!,
+          );
+          break;
+        }
+
+        if (base == 'data.yaml' || base == 'data.yml') {
+          final parsed = DetectionAccuracy.parseDataYaml(
+            (await read(e.name))!,
+          );
+
+          if (parsed.isNotEmpty) {
+            names = parsed;
+            break;
+          }
+        }
+      }
+
+      final labels = <String, List<NormBox>>{};
+      final predicted = <String, List<NormBox>>{};
+
+      for (final unit in detections.entries) {
+        final url = distributionManager.getUnitFileUrl(
+          jobId,
+          unit.key,
+        );
+        final image = url == null
+            ? null
+            : Uri.parse(url).queryParameters['entry'];
+
+        if (image == null) continue;
+
+        final stem = path.posix.withoutExtension(image);
+        final candidates = [
+          if (stem.contains('images/'))
+            '${stem.substring(0, stem.lastIndexOf('images/'))}'
+                'labels/${stem.substring(stem.lastIndexOf('images/') + 7)}.txt',
+          '$stem.txt',
+        ];
+
+        for (final c in candidates) {
+          final text = await read(c);
+
+          if (text != null) {
+            labels[image] =
+                DetectionAccuracy.parseYoloLabels(text, names);
+            predicted[image] =
+                DetectionAccuracy.parseDetections(unit.value);
+            break;
+          }
+        }
+      }
+
+      if (labels.isEmpty) return null;
+
+      return DetectionAccuracy.evaluate(labels, predicted);
+    } catch (e) {
+      _logger.log('⚠️ Could not score accuracy: $e');
+      return null;
+    }
+  }
+
+  Future<shelf.Response> _handleAccuracy(
+    shelf.Request request,
+  ) async {
+    final jobId =
+        request.url.queryParameters['job'] ?? _currentJobId();
+    final result = await _accuracyFor(jobId);
+
+    return shelf.Response.ok(
+      jsonEncode({
+        'job': jobId,
+        'available': result != null,
+        if (result != null) ...result.toJson(),
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    );
+  }
+
   /// A worker could not process a unit. It goes back to the pool at once and
   /// is left out of the unit records and recent results, so it never counts
   /// as a completed image with no detections.
@@ -2445,6 +2621,43 @@ class FileServerService {
   // PER-PHONE METRICS + SCHEDULER SELECTION
   // ---------------------------------------------------------------------------
 
+  /// Refuses guarded requests from other phones that do not carry the
+  /// session PIN (see [requiredPin]).
+  shelf.Middleware _pinMiddleware() {
+    return (shelf.Handler inner) {
+      return (shelf.Request request) async {
+        final allowed = SessionAuth.allows(
+          path: request.url.path,
+          requiredPin: requiredPin,
+          given: request.headers[SessionAuth.header] ??
+              request.url.queryParameters['pin'],
+          fromThisPhone: _fromThisPhone(request),
+        );
+
+        if (allowed) {
+          return inner(request);
+        }
+
+        return shelf.Response(
+          401,
+          body: 'Session PIN required',
+        );
+      };
+    };
+  }
+
+  bool _fromThisPhone(shelf.Request request) {
+    final info = request.context['shelf.io.connection_info'];
+
+    if (info is! HttpConnectionInfo) return false;
+
+    final address = info.remoteAddress;
+
+    return address.isLoopback ||
+        address.address == _networkAccessibleIp ||
+        address.address == _serverIp;
+  }
+
   /// Counts every HTTP body byte this phone serves/receives, per peer, so the
   /// host's own network load can be attributed to each worker.
   shelf.Middleware _trafficMiddleware() {
@@ -2495,7 +2708,8 @@ class FileServerService {
     );
   }
 
-  /// kind = summary (default) | samples | units; optional device=<ip>.
+  /// kind = summary (default) | samples | units | runs; optional device=<ip>
+  /// (runs always covers every phone: one row per run, for comparison).
   Future<shelf.Response> _handleMetricsCsv(shelf.Request request) async {
     final store = MetricsStore.instance;
     final device = request.url.queryParameters['device'];
@@ -2507,6 +2721,9 @@ class FileServerService {
         break;
       case 'units':
         csv = store.unitsCsv(deviceKey: device);
+        break;
+      case 'runs':
+        csv = store.runsCsv();
         break;
       default:
         csv = store.summaryCsv(deviceKey: device);

@@ -17,6 +17,7 @@ import 'topic_manager.dart';
 import 'network_helper.dart';
 import 'client_metrics_publisher.dart';
 import 'performance_service.dart';
+import 'session_auth.dart';
 import 'device_info_helper.dart';
 import 'distribution_singleton.dart';
 import 'metrics/metrics_store.dart';
@@ -168,8 +169,16 @@ class MqttService extends ChangeNotifier {
   }
   
   // MQTT Broker functionality
+  /// The PIN workers must enter to join this session (host), or the one
+  /// entered to join (worker). Null when none is set.
+  String? get sessionPin => SessionAuth.pin;
+
   Future<bool> startBroker() async {
-    final success = await _brokerManager.startBroker();
+    // Every hosted session gets a fresh PIN: the broker, and the admin and
+    // assignment endpoints, refuse other phones on the Wi-Fi without it.
+    SessionAuth.pin = SessionAuth.generatePin();
+    _fileServerService.requiredPin = SessionAuth.pin;
+    final success = await _brokerManager.startBroker(pin: SessionAuth.pin);
     
     if (success) {
       // PerformanceService is a lazy singleton: touch it so the host records its own
@@ -236,10 +245,15 @@ class MqttService extends ChangeNotifier {
     }
     
     await _brokerManager.stopBroker();
+    SessionAuth.pin = null;
+    _fileServerService.requiredPin = null;
   }
   
   /// Connect to MQTT broker as a client
-  Future<bool> connect(String brokerIp) async {
+  /// Join the session at [brokerIp]; [pin] is the one the host shows.
+  Future<bool> connect(String brokerIp, {String? pin}) async {
+    final typed = pin?.trim();
+    SessionAuth.pin = (typed == null || typed.isEmpty) ? null : typed;
     final success = await _clientManager.connect(brokerIp);
     
     if (success) {
@@ -318,7 +332,7 @@ class MqttService extends ChangeNotifier {
                   'warmup': true,
                 });
                 try {
-                  await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
+                  await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json', ...SessionAuth.headers}, body: body);
                   TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
                   TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
                   TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);

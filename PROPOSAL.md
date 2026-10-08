@@ -43,7 +43,7 @@ grounded in something found in the code; file references are included.
 * Co-locate work with data: skip transfer for units a phone already holds.
 
 ## 5. Housekeeping
-* **Security:** the MQTT broker has no authentication and the `/admin/*` HTTP endpoints (including the new scheduler/metrics ones) are open to anyone on the Wi-Fi. Fine for a lab network; add a shared token before anything wider.
+* **Security:** *Done: a per-session 6-digit PIN guards the broker (MQTT login) and `/admin/*`, `/assignments/*` and the file list (HTTP).* The MQTT broker had no authentication and the `/admin/*` HTTP endpoints (including the new scheduler/metrics ones) are open to anyone on the Wi-Fi. Fine for a lab network; add a shared token before anything wider.
 * **Tests/CI:** *Done: `test/widget_test.dart` is a real smoke test and `.github/workflows/ci.yml` runs `flutter analyze --no-fatal-infos` and `flutter test`.* `test/widget_test.dart` was the stale Flutter counter template and failed. New unit tests live in `test/metrics_and_scheduler_test.dart`. A CI job running `flutter analyze` and `flutter test` would catch regressions.
 * **Job model:** the code still special-cases `demo_job` and uses the shared file id as the job id; a real job object (id, dataset, model, scheduler, status) would simplify the UI and the harness.
 * The MQTT client previously handled only the first message of each delivery batch (now fixed); worth a regression test with a live broker.

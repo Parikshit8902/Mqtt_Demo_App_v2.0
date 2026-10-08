@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import '../services/assignments_client.dart';
 import '../services/distribution_singleton.dart';
 import '../services/metrics/metrics_store.dart';
+import '../services/metrics/run_metrics.dart';
 import '../services/metrics/traffic_counter.dart';
 import '../services/mqtt_service.dart';
 import '../services/schedulers/scheduler_registry.dart';
@@ -96,7 +97,7 @@ class _MetricsReportScreenState extends State<MetricsReportScreen> {
               _chartCard(device),
               const SizedBox(height: 12),
               _freshnessCard(device),
-              if (_isHost) ...[const SizedBox(height: 12), _workCard()],
+              if (_isHost) ...[const SizedBox(height: 12), _workCard(), const SizedBox(height: 12), _runCard()],
               const SizedBox(height: 16),
               _summaryGrid(summary),
               const SizedBox(height: 16),
@@ -497,6 +498,78 @@ class _MetricsReportScreenState extends State<MetricsReportScreen> {
                   ],
                 ),
               ),
+        ],
+      ),
+    );
+  }
+
+  /// The numbers used to compare runs: this one, then earlier ones since the
+  /// app started (a reset archives the run that just finished).
+  Widget _runCard() {
+    final run = _store.runMetrics();
+    final rows = <(String, RunMetrics)>[
+      for (var i = 0; i < _store.runHistory.length; i++) ('${i + 1}', _store.runHistory[i]),
+      if (run.units > 0) ('now', run),
+    ];
+    String n(double v, int d) => v.toStringAsFixed(d);
+    TextStyle cell({bool bold = false}) => TextStyle(fontSize: 11, fontWeight: bold ? FontWeight.w600 : FontWeight.w400);
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: _boxDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: const [
+            Icon(Icons.compare_arrows, size: 16),
+            SizedBox(width: 6),
+            Text('Run metrics', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          ]),
+          const SizedBox(height: 8),
+          if (run.units == 0)
+            Text('No finished images in this run yet.', style: TextStyle(fontSize: 12, color: Colors.grey.shade600))
+          else
+            Text(
+              'Makespan ${n(run.makespanS, 1)} s · ${n(run.throughput, 3)} images/s · '
+              'latency p50 ${n(run.p50LatencyMs, 0)} ms, p95 ${n(run.p95LatencyMs, 0)} ms · '
+              'Jain ${n(run.jainUnits, 3)} (images), ${n(run.jainBusy, 3)} (busy time) · '
+              '${run.energyPerImageJ == null ? 'energy n/a' : '${n(run.energyPerImageJ!, 2)} J/image'}',
+              style: const TextStyle(fontSize: 12),
+            ),
+          if (rows.length > 1) ...[
+            const SizedBox(height: 10),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: DataTable(
+                headingRowHeight: 28,
+                dataRowMinHeight: 24,
+                dataRowMaxHeight: 28,
+                columnSpacing: 14,
+                horizontalMargin: 0,
+                columns: [
+                  for (final h in ['Run', 'Scheduler', 'Makespan s', 'Images/s', 'p95 ms', 'Jain', 'J/image'])
+                    DataColumn(label: Text(h, style: cell(bold: true)), numeric: h != 'Run' && h != 'Scheduler'),
+                ],
+                rows: [
+                  for (final (label, r) in rows)
+                    DataRow(cells: [
+                      DataCell(Text(label, style: cell(bold: label == 'now'))),
+                      DataCell(Text(r.scheduler, style: cell())),
+                      DataCell(Text(n(r.makespanS, 1), style: cell())),
+                      DataCell(Text(n(r.throughput, 3), style: cell())),
+                      DataCell(Text(n(r.p95LatencyMs, 0), style: cell())),
+                      DataCell(Text(n(r.jainUnits, 3), style: cell())),
+                      DataCell(Text(r.energyPerImageJ == null ? 'n/a' : n(r.energyPerImageJ!, 2), style: cell())),
+                    ]),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 4),
+          Text(
+            'Resetting the experiment keeps this run here for comparison. Export includes runs.csv.',
+            style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+          ),
         ],
       ),
     );

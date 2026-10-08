@@ -6,6 +6,7 @@ import 'message_logger.dart';
 import 'device_info_helper.dart';
 import 'network_helper.dart';
 import 'metrics/traffic_counter.dart';
+import 'session_auth.dart';
 
 /// Manages MQTT client connections and operations
 class MqttClientManager {
@@ -88,10 +89,15 @@ class MqttClientManager {
       
       // Create connection message
       _logger.log('📝 Creating connection message');
-      final connMess = MqttConnectMessage()
+      var connMess = MqttConnectMessage()
           .withClientIdentifier(_clientId)
           .startClean()
           .withWillQos(MqttQos.atLeastOnce);
+      // A session that requires a PIN only accepts this login.
+      final pin = SessionAuth.pin;
+      if (pin != null && pin.isNotEmpty) {
+        connMess = connMess.authenticateAs(SessionAuth.mqttUsername, pin);
+      }
       
       _client!.connectionMessage = connMess;
       

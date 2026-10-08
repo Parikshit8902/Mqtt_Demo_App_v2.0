@@ -178,7 +178,8 @@ void main() {
       final dir = await Directory.systemTemp.createTemp('metrics_test');
       try {
         final files = await s.exportTo(dir);
-        expect(files.length, 5);
+        expect(files.length, 6);
+        expect(files.any((f) => f.path.endsWith('_runs.csv')), isTrue);
         for (final f in files) {
           expect(await f.exists(), isTrue);
         }

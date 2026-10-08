@@ -757,6 +757,44 @@ class DistributionManager {
     return assignedForClient;
   }
 
+  /// Units to hand [requesterId] in one request when batching adapts to the
+  /// work left (guided self-scheduling): about a (2 x active phones)-th of
+  /// the units still available, never more than [maxUnits] nor fewer than one.
+  /// Batches are large while plenty remains, which cuts control traffic, and
+  /// shrink to one unit near the end, so no phone sits on the last units
+  /// while the others go idle.
+  int adaptiveBatchSize(
+    String jobId,
+    int maxUnits,
+    String requesterId,
+  ) {
+    if (maxUnits <= 1) {
+      return 1;
+    }
+
+    final status = _unitStatus[jobId];
+
+    if (status == null) {
+      return maxUnits;
+    }
+
+    final available = status.values
+        .where(
+          (v) => v == 'available',
+        )
+        .length;
+
+    final active =
+        _snapshotFor(requesterId).length;
+
+    final phones = active < 1 ? 1 : active;
+
+    final share =
+        (available / (2 * phones)).ceil();
+
+    return share.clamp(1, maxUnits);
+  }
+
   /// Produce a scheduling suggestion without mutating internal state.
   ///
   /// Useful for logging or previewing assignments.

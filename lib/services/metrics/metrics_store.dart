@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import '../models/device_health.dart';
+import 'run_metrics.dart';
 import 'traffic_counter.dart';
 
 // ---------------------------------------------------------------------------
@@ -378,6 +379,14 @@ class MetricsStore extends ChangeNotifier {
   /// When the current experiment began (first assignment after a reset), host clock.
   int? experimentStartMs;
 
+  /// When the latest finished unit was recorded, this phone's clock (on the
+  /// host: when its result arrived). Ends the run's makespan.
+  int? lastUnitAtMs;
+
+  /// Runs finished before the last reset, oldest first, for comparison.
+  final List<RunMetrics> runHistory = [];
+  static const int _maxRunHistory = 50;
+
   void recordDecision(DecisionRecord d) {
     experimentStartMs ??= d.t;
     decisions.add(d);
@@ -463,9 +472,10 @@ class MetricsStore extends ChangeNotifier {
   }
 
   /// Record a finished unit for [deviceKey] (replaces any earlier record for the same unit).
-  void recordUnit(String deviceKey, UnitRecord u) {
+  void recordUnit(String deviceKey, UnitRecord u, {int? nowMs}) {
     final d = deviceKey == local.key ? local : _remoteDevice(deviceKey, null);
     d.units[u.id] = u;
+    lastUnitAtMs = nowMs ?? DateTime.now().millisecondsSinceEpoch;
     notifyListeners();
   }
 
@@ -514,7 +524,15 @@ class MetricsStore extends ChangeNotifier {
   /// Traffic breakdown for [d]: live counters for this phone, uploaded for others.
   Map<String, dynamic>? trafficOf(DeviceMetrics d) => d.isLocal ? TrafficCounter.instance.toJson() : d.traffic;
 
+  /// Clears everything for a new experiment. The finished run's comparison
+  /// numbers are kept in [runHistory] first.
   void clear() {
+    final finished = runMetrics();
+    if (finished.units > 0) {
+      runHistory.add(finished);
+      if (runHistory.length > _maxRunHistory) runHistory.removeAt(0);
+    }
+    lastUnitAtMs = null;
     local.samples.clear();
     local.units.clear();
     local.polls.clear();
@@ -565,6 +583,46 @@ class MetricsStore extends ChangeNotifier {
     );
   }
 
+  /// Comparison numbers for the current run: every finished unit on every
+  /// phone, the workers that finished none, and every phone's modelled energy.
+  RunMetrics runMetrics() {
+    final latencies = <({String unitId, String phone, int latencyMs})>[];
+    final idle = <String>[];
+    var energyJ = 0.0;
+    for (final d in devices) {
+      for (final u in d.units.values) {
+        final ms = u.totalMs > 0 ? u.totalMs : u.downloadMs + u.inferMs;
+        latencies.add((unitId: u.id, phone: d.key, latencyMs: ms));
+      }
+      if (d.units.isEmpty && !d.isLocal) idle.add(d.key);
+      energyJ += summarize(d).energyModelJ;
+    }
+    return RunMetrics.compute(
+      scheduler: schedulerId,
+      startMs: experimentStartMs,
+      endMs: lastUnitAtMs,
+      latencies: latencies,
+      phonesWithNoWork: idle,
+      totalEnergyJ: energyJ,
+    );
+  }
+
+  /// One row per earlier run, then the current run if it has finished units.
+  String runsCsv() {
+    final b = StringBuffer(_csvRow(['run', ...RunMetrics.csvHeader]))..write('\n');
+    var i = 1;
+    for (final r in runHistory) {
+      b.write(_csvRow(['${i++}', ...r.csvCells()]));
+      b.write('\n');
+    }
+    final current = runMetrics();
+    if (current.units > 0) {
+      b.write(_csvRow(['current', ...current.csvCells()]));
+      b.write('\n');
+    }
+    return b.toString();
+  }
+
   // -- export ---------------------------------------------------------------
 
   String samplesCsv({String? deviceKey}) {
@@ -602,6 +660,8 @@ class MetricsStore extends ChangeNotifier {
   Map<String, dynamic> toJson({String? deviceKey}) => {
         'exported_at': DateTime.now().toIso8601String(),
         'scheduler': schedulerId,
+        'run': runMetrics().toJson(),
+        'previous_runs': runHistory.map((r) => r.toJson()).toList(),
         'devices': [
           for (final d in devices.where((d) => deviceKey == null || d.key == deviceKey))
             {
@@ -636,7 +696,7 @@ class MetricsStore extends ChangeNotifier {
     return b.toString();
   }
 
-  /// Writes `<name>_summary.csv`, `_samples.csv`, `_units.csv`, `_decisions.csv` and `_full.json`.
+  /// Writes `<name>_summary.csv`, `_samples.csv`, `_units.csv`, `_decisions.csv`, `_runs.csv` and `_full.json`.
   /// [baseName] is the file name the user chose; without it a timestamped name is used.
   Future<List<File>> exportTo(Directory dir, {String? deviceKey, String? baseName}) async {
     await dir.create(recursive: true);
@@ -656,6 +716,7 @@ class MetricsStore extends ChangeNotifier {
     await write('samples.csv', samplesCsv(deviceKey: deviceKey));
     await write('units.csv', unitsCsv(deviceKey: deviceKey));
     await write('decisions.csv', decisionsCsv());
+    await write('runs.csv', runsCsv());
     await write('full.json', const JsonEncoder.withIndent('  ').convert(toJson(deviceKey: deviceKey)));
     return files;
   }
