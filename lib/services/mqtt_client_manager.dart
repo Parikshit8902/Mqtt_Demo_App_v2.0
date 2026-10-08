@@ -125,6 +125,7 @@ class MqttClientManager {
               topic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt,
               payloadBytes,
             );
+            TrafficCounter.instance.countRxMsg(topic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt);
             TrafficCounter.instance.mqttFramingRx += TrafficCounter.mqttFraming(topic, payloadBytes);
 
             // Process message based on topic
@@ -259,6 +260,7 @@ class MqttClientManager {
           pubTopic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt,
           sentBytes,
         );
+        TrafficCounter.instance.countTxMsg(pubTopic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt);
         TrafficCounter.instance.mqttFramingTx += TrafficCounter.mqttFraming(pubTopic, sentBytes);
         // _logger.log('🚀 Message published successfully');
         

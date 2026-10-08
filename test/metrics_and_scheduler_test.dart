@@ -178,7 +178,7 @@ void main() {
       final dir = await Directory.systemTemp.createTemp('metrics_test');
       try {
         final files = await s.exportTo(dir);
-        expect(files.length, 4);
+        expect(files.length, 5);
         for (final f in files) {
           expect(await f.exists(), isTrue);
         }

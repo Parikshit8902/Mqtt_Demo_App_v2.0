@@ -1,4 +1,5 @@
 import 'message_logger.dart';
+import 'metrics/metrics_store.dart';
 import 'models/assignment.dart';
 import 'models/result_dto.dart';
 import 'utils/http_helper.dart';
@@ -21,6 +22,8 @@ class AssignmentsClient {
   }
 
   Future<PerClientAssignment?> requestNext(String jobId, String clientId) async {
+    // Counted here so the worker's own screen can show how often it polls.
+    MetricsStore.instance.recordPoll(MetricsStore.instance.local.key);
     try {
       final url = Uri.parse('$serverBase/assignments/$jobId/next?for=$clientId');
       final j = await httpGetJson(url);

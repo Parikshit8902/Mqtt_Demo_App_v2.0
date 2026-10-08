@@ -7,6 +7,8 @@ import '../metrics/traffic_counter.dart';
 Future<dynamic> httpGetJson(Uri url) async {
   final resp = await http.get(url);
   TrafficCounter.instance.addRx(TrafficChannel.httpControl, resp.bodyBytes.length);
+  TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
+  TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
   if (resp.statusCode == 200) {
     if (resp.body.isEmpty) return null;
     return jsonDecode(resp.body);
@@ -19,6 +21,8 @@ Future<dynamic> httpPostJson(Uri url, Object body) async {
   final resp = await http.post(url, headers: {'Content-Type': 'application/json'}, body: encoded);
   TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(encoded).length);
   TrafficCounter.instance.addRx(TrafficChannel.httpControl, resp.bodyBytes.length);
+  TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
+  TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
   if (resp.statusCode == 200) {
     if (resp.body.isEmpty) return null;
     return jsonDecode(resp.body);

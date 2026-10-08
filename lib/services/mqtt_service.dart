@@ -294,11 +294,14 @@ class MqttService extends ChangeNotifier {
                   'client_id': _clientManager.clientId,
                   'ttproc_ms': res.ttprocMs.round(),
                   'bandwidth_kBps': res.bandwidthKBps,
+                  'model': modelFile.path.split(RegExp(r'[\\/]')).last,
                   'warmup': true,
                 });
                 try {
                   await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
                   TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
+                  TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
+                  TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
                   _logger.log('✅ Posted warmup results to host: $postUrl');
                   // Start client worker to fetch assignments and run inference on assigned units
                   try {

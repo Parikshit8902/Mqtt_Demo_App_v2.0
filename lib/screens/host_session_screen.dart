@@ -12,6 +12,7 @@ import '../services/topic_manager.dart';
 import '../services/distribution_singleton.dart';
 import '../services/schedulers/scheduler_type.dart';
 import '../widgets/scheduling_algorithm_selector.dart';
+import '../widgets/file_name_dialog.dart';
 
 enum DistributionStep {
   idle,
@@ -453,8 +454,15 @@ class _HostSessionScreenState
 
   Future<void> _downloadMetrics() async {
     try {
+      // Ask for the file name first; it is also printed inside the report.
+      final chosenName = await askFileName(context);
+
+      if (chosenName == null) return;
+
       final base = widget.mqttService.serverUrl;
-      final url = Uri.parse('$base/admin/metrics');
+      final url = Uri.parse('$base/admin/metrics').replace(
+        queryParameters: {'name': chosenName},
+      );
 
       final response = await http.get(url);
 
@@ -471,8 +479,7 @@ class _HostSessionScreenState
         return;
       }
 
-      final defaultFileName =
-          'experiment_metrics_${DateTime.now().millisecondsSinceEpoch}.txt';
+      final defaultFileName = '$chosenName.txt';
 
       final savedPath = await FilePicker.platform.saveFile(
         dialogTitle: 'Save Experiment Metrics',

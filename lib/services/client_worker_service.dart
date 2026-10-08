@@ -18,6 +18,8 @@ class ClientWorkerService extends ChangeNotifier {
 
   bool _running = false;
   bool _didWork = false; // processed units since the last report upload
+  DateTime _lastReportPush = DateTime.fromMillisecondsSinceEpoch(0);
+  static const Duration _reportPushEvery = Duration(seconds: 30);
   String jobId;
   String clientId;
 
@@ -70,6 +72,8 @@ class ClientWorkerService extends ChangeNotifier {
               final bytes = await streamed.stream.toBytes();
               dlSw.stop();
               TrafficCounter.instance.addRx(TrafficChannel.httpData, bytes.length);
+              TrafficCounter.instance.countTxMsg(TrafficChannel.httpData); // the GET request
+              TrafficCounter.instance.countRxMsg(TrafficChannel.httpData); // the image response
               // Run inference on bytes
               final sw = Stopwatch()..start();
               Map<String, dynamic> inferRes = {};
@@ -111,6 +115,13 @@ class ClientWorkerService extends ChangeNotifier {
                 _logger.log('✅ Posted result for unit ${unit.unitIndex} (infer=${ttMs}ms download=${dlMs}ms bw=${bwKbps.toStringAsFixed(1)}kB/s)');
               } else {
                 _logger.log('⚠️ Failed to post result for unit ${unit.unitIndex}');
+              }
+
+              // Keep the host's copy of this phone's recording (2 s samples, traffic
+              // and message counts) fresh while it works, not only when it finishes.
+              if (DateTime.now().difference(_lastReportPush) > _reportPushEvery) {
+                _lastReportPush = DateTime.now();
+                await pushMetricsReport();
               }
             } else {
               _logger.log('❌ Failed to download unit ${unit.unitIndex}: ${streamed.statusCode}');

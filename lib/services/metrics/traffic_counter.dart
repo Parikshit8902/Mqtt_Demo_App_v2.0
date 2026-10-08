@@ -26,6 +26,11 @@ class TrafficCounter {
   final Map<String, int> _tx = {};
   final Map<String, int> _rx = {};
 
+  /// Application-level messages (one MQTT publish, one HTTP request or response),
+  /// as opposed to bytes. Network *packets* come from the OS counters instead.
+  final Map<String, int> _txMsgs = {};
+  final Map<String, int> _rxMsgs = {};
+
   /// Estimated MQTT framing (fixed header + topic) that is not part of the payload.
   int mqttFramingTx = 0;
   int mqttFramingRx = 0;
@@ -46,6 +51,13 @@ class TrafficCounter {
     if (peer != null) peerRx[peer] = (peerRx[peer] ?? 0) + bytes;
   }
 
+  void countTxMsg(String channel, [int n = 1]) => _txMsgs[channel] = (_txMsgs[channel] ?? 0) + n;
+
+  void countRxMsg(String channel, [int n = 1]) => _rxMsgs[channel] = (_rxMsgs[channel] ?? 0) + n;
+
+  int txMsgs(String channel) => _txMsgs[channel] ?? 0;
+  int rxMsgs(String channel) => _rxMsgs[channel] ?? 0;
+
   /// MQTT 3.1.1 PUBLISH (QoS 0) framing: 1 byte fixed header + 1..4 bytes
   /// remaining length + 2 byte topic length + topic. Excludes TCP/IP.
   static int mqttFraming(String topic, int payloadBytes) {
@@ -63,6 +75,8 @@ class TrafficCounter {
   Map<String, dynamic> toJson() => {
         'tx': Map<String, int>.from(_tx),
         'rx': Map<String, int>.from(_rx),
+        'tx_msgs': Map<String, int>.from(_txMsgs),
+        'rx_msgs': Map<String, int>.from(_rxMsgs),
         'mqtt_framing_tx': mqttFramingTx,
         'mqtt_framing_rx': mqttFramingRx,
         'peer_tx': Map<String, int>.from(peerTx),
@@ -72,6 +86,8 @@ class TrafficCounter {
   void reset() {
     _tx.clear();
     _rx.clear();
+    _txMsgs.clear();
+    _rxMsgs.clear();
     peerTx.clear();
     peerRx.clear();
     mqttFramingTx = 0;

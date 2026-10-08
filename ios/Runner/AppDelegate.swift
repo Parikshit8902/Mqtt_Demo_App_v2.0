@@ -44,6 +44,10 @@ final class PerformanceChannel {
   private var lastTx: UInt32 = 0
   private var totalRx: Int64 = 0
   private var totalTx: Int64 = 0
+  private var lastRxPkts: UInt32 = 0
+  private var lastTxPkts: UInt32 = 0
+  private var totalRxPkts: Int64 = 0
+  private var totalTxPkts: Int64 = 0
   private var haveBaseline = false
 
   func register(with messenger: FlutterBinaryMessenger) {
@@ -123,21 +127,27 @@ final class PerformanceChannel {
       metrics["cpuJiffies"] = micros
     }
 
-    if let (rx, tx) = wifiCounters() {
+    if let (rx, tx, rxPkts, txPkts) = wifiCounters() {
       if haveBaseline {
         totalRx += Int64(rx &- lastRx) // wrapping subtraction handles the 32-bit rollover
         totalTx += Int64(tx &- lastTx)
+        totalRxPkts += Int64(rxPkts &- lastRxPkts)
+        totalTxPkts += Int64(txPkts &- lastTxPkts)
       }
       lastRx = rx
       lastTx = tx
+      lastRxPkts = rxPkts
+      lastTxPkts = txPkts
       haveBaseline = true
       metrics["netRxBytes"] = Int(totalRx)
       metrics["netTxBytes"] = Int(totalTx)
+      metrics["netRxPackets"] = Int(totalRxPkts)
+      metrics["netTxPackets"] = Int(totalTxPkts)
     }
     return metrics
   }
 
-  private func wifiCounters() -> (UInt32, UInt32)? {
+  private func wifiCounters() -> (UInt32, UInt32, UInt32, UInt32)? {
     var ifaddr: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
     defer { freeifaddrs(ifaddr) }
@@ -147,7 +157,7 @@ final class PerformanceChannel {
       if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_LINK),
          String(cString: ifa.ifa_name) == "en0", let data = ifa.ifa_data {
         let d = data.assumingMemoryBound(to: if_data.self).pointee
-        return (d.ifi_ibytes, d.ifi_obytes)
+        return (d.ifi_ibytes, d.ifi_obytes, d.ifi_ipackets, d.ifi_opackets)
       }
       ptr = ifa.ifa_next
     }

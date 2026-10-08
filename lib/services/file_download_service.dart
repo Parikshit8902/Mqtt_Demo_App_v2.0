@@ -143,6 +143,8 @@ class FileDownloadService {
         request.headers['Pragma'] = 'no-cache';
 
         final streamedResponse = await client.send(request);
+        TrafficCounter.instance.countTxMsg(TrafficChannel.httpData);
+        TrafficCounter.instance.countRxMsg(TrafficChannel.httpData);
 
         if (streamedResponse.statusCode == 200 || streamedResponse.statusCode == 206) {
           task.status = DownloadStatus.inProgress;

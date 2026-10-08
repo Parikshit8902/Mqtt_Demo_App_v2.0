@@ -15,6 +15,7 @@ import 'models/result_dto.dart';
 import 'models/assignment.dart';
 import 'network_helper.dart';
 import 'metrics/metrics_store.dart';
+import 'experiment_report.dart';
 import 'metrics/traffic_counter.dart';
 import 'schedulers/scheduler_registry.dart';
 
@@ -1444,6 +1445,69 @@ class FileServerService {
   // METRICS DOWNLOAD
   // ---------------------------------------------------------------------------
 
+  /// Assemble the data for [buildExperimentReport] from the live state.
+  String _buildReport({
+    required String fileName,
+    required DateTime generatedAt,
+  }) {
+    final store = MetricsStore.instance;
+    final jobId = _currentJobId();
+    final dataset = _sharedFiles[jobId];
+
+    final models = <String>{
+      for (final r in _warmupReports.values)
+        if (r['model'] is String && (r['model'] as String).isNotEmpty) r['model'] as String,
+    }.toList()
+      ..sort();
+
+    DeviceMetrics metricsFor(String ip, String name) =>
+        store.device(ip) ?? DeviceMetrics(ip, name);
+
+    final devices = <ReportDevice>[];
+
+    for (final cid in distributionManager.registeredClientIds) {
+      final name = deviceNameFromClientId(cid);
+      final ip = deviceKeyFromClientId(cid);
+      final dm = metricsFor(ip, name);
+
+      devices.add(ReportDevice(
+        name: name,
+        ip: ip,
+        isMaster: false,
+        imagesProcessed: dm.units.length,
+        summary: store.summarize(dm),
+        traffic: store.trafficOf(dm),
+      ));
+    }
+
+    final host = store.local;
+
+    devices.add(ReportDevice(
+      name: host.name,
+      ip: host.key,
+      isMaster: true,
+      imagesProcessed: 0,
+      summary: store.summarize(host),
+      traffic: store.trafficOf(host),
+    ));
+
+    final start = store.experimentStartMs;
+
+    return buildExperimentReport(
+      fileName: fileName,
+      generatedAt: generatedAt,
+      experimentStart: start == null ? null : DateTime.fromMillisecondsSinceEpoch(start),
+      models: models,
+      datasetName: dataset?.name,
+      datasetBytes: dataset?.size,
+      datasetUnits: distributionManager.jobProgress(jobId)['total'] ?? 0,
+      schedulerName: '${distributionManager.schedulerName} (${distributionManager.schedulerId})',
+      scheduleCalls: distributionManager.scheduleCalls,
+      avgScheduleMs: distributionManager.avgScheduleMs,
+      devices: devices,
+    );
+  }
+
   /// Generate a plain-text metrics report for the current experiment.
   ///
   /// The report contains only information accumulated since the most recent
@@ -1469,15 +1533,19 @@ class FileServerService {
       final generatedAt =
           DateTime.now();
 
-      buffer.writeln(
-        'DISTRIBUTED INFERENCE EXPERIMENT METRICS',
-      );
-      buffer.writeln(
-        '========================================',
-      );
-      buffer.writeln(
-        'Generated: ${generatedAt.toIso8601String()}',
-      );
+      // Header sections: file name and time, model, dataset, algorithm,
+      // clients, per-client images, compute/network metrics, packets/overhead.
+      buffer.write(_buildReport(
+        fileName: MetricsStore.safeFileName(
+          request.url.queryParameters['name'],
+        ),
+        generatedAt: generatedAt,
+      ));
+
+      buffer.writeln();
+      buffer.writeln('=======================================');
+      buffer.writeln('DETAILED LOGS');
+      buffer.writeln('=======================================');
       buffer.writeln();
 
       // -----------------------------------------------------------------------
@@ -1821,7 +1889,7 @@ class FileServerService {
           'Content-Type':
               'text/plain; charset=utf-8',
           'Content-Disposition':
-              'attachment; filename="experiment_metrics.txt"',
+              'attachment; filename="${MetricsStore.safeFileName(request.url.queryParameters['name'])}.txt"',
           'Cache-Control':
               'no-cache, no-store, must-revalidate',
           'Pragma': 'no-cache',
@@ -1926,6 +1994,7 @@ class FileServerService {
       // Asking for work proves the phone is alive, even before it has
       // finished a unit or sent any metrics.
       distributionManager.touchClient(clientId);
+      MetricsStore.instance.recordPoll(deviceKeyFromClientId(clientId));
 
       final units =
           distributionManager.assignNext(
@@ -2010,6 +2079,29 @@ class FileServerService {
 
         if (_schedulerLogs.length > 50) {
           _schedulerLogs.removeLast();
+        }
+      } catch (_) {}
+
+      // Keep a longer, exportable history of who got what and how each phone scored.
+      try {
+        if (units.isNotEmpty) {
+          final scored = <String, double>{};
+          final clientsTrace = trace?['clients'];
+          if (clientsTrace is Map) {
+            clientsTrace.forEach((id, v) {
+              if (v is Map && v['health'] is num) {
+                scored[deviceKeyFromClientId('$id')] = (v['health'] as num).toDouble();
+              }
+            });
+          }
+          MetricsStore.instance.recordDecision(DecisionRecord(
+            t: DateTime.now().millisecondsSinceEpoch,
+            deviceKey: deviceKeyFromClientId(clientId),
+            deviceName: deviceNameFromClientId(clientId),
+            units: units.map((u) => u.unitIndex).toList(),
+            scheduler: distributionManager.schedulerId,
+            healthByDevice: scored,
+          ));
         }
       } catch (_) {}
 
@@ -2270,6 +2362,9 @@ class FileServerService {
         final channel = request.url.path.startsWith('files') ? TrafficChannel.httpData : TrafficChannel.httpControl;
         final info = request.context['shelf.io.connection_info'];
         final peer = info is HttpConnectionInfo ? info.remoteAddress.address : null;
+        // One request in, one response out, whatever the number of body chunks.
+        TrafficCounter.instance.countRxMsg(channel);
+        TrafficCounter.instance.countTxMsg(channel);
         final counted = request.change(
           body: request.read().map((chunk) {
             TrafficCounter.instance.addRx(channel, chunk.length, peer: peer);

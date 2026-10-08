@@ -548,6 +548,9 @@ class MainActivity: FlutterActivity() {
                     // This is the correct way and works for both local Wi-Fi and internet.
                     metrics["netRxBytes"] = TrafficStats.getUidRxBytes(uid) // Received bytes
                     metrics["netTxBytes"] = TrafficStats.getUidTxBytes(uid) // Transmitted bytes
+                    // Packets let the report compare "messages the app sent" with what hit the wire.
+                    metrics["netRxPackets"] = TrafficStats.getUidRxPackets(uid)
+                    metrics["netTxPackets"] = TrafficStats.getUidTxPackets(uid)
 
                     result.success(metrics)
                 }

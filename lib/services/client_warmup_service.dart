@@ -39,6 +39,8 @@ class ClientWarmupService {
 
       final bytes = resp.bodyBytes;
       TrafficCounter.instance.addRx(TrafficChannel.httpData, bytes.length);
+      TrafficCounter.instance.countTxMsg(TrafficChannel.httpData);
+      TrafficCounter.instance.countRxMsg(TrafficChannel.httpData);
       // If the warmup bundle is a ZIP, try to extract a first compatible image
       List<int> imageBytes = bytes;
       try {

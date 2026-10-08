@@ -44,6 +44,8 @@ class MetricSample {
   final int rxBytes; // on-wire cumulative since app start
   final int txBytes;
   final int payloadBytes; // app-layer payload (TrafficCounter) cumulative, rx+tx
+  final int rxPackets; // on-wire packets (OS counters) cumulative since app start
+  final int txPackets;
   final int battery; // percent, -1 unknown
   final double? measuredMw; // whole-device draw from battery current*voltage (Android, unplugged)
   final double modelMw; // modelled app draw
@@ -64,6 +66,8 @@ class MetricSample {
     required this.rxBytes,
     required this.txBytes,
     required this.payloadBytes,
+    this.rxPackets = 0,
+    this.txPackets = 0,
     required this.battery,
     required this.measuredMw,
     required this.modelMw,
@@ -85,6 +89,8 @@ class MetricSample {
         'rxk': double.parse(rxKBps.toStringAsFixed(1)),
         'txk': double.parse(txKBps.toStringAsFixed(1)),
         'ap': payloadBytes,
+        if (rxPackets > 0) 'rp': rxPackets,
+        if (txPackets > 0) 'tp': txPackets,
         if (measuredMw != null) 'pw': double.parse(measuredMw!.toStringAsFixed(0)),
         'pm': double.parse(modelMw.toStringAsFixed(0)),
         'e': double.parse(energyModelJ.toStringAsFixed(2)),
@@ -114,6 +120,8 @@ class MetricSample {
       rxBytes: _i(j['rx']),
       txBytes: _i(j['tx']),
       payloadBytes: _i(j['ap']),
+      rxPackets: _i(j['rp']),
+      txPackets: _i(j['tp']),
       battery: battery,
       measuredMw: j['pw'] is num ? (j['pw'] as num).toDouble() : null,
       modelMw: _d(j['pm']),
@@ -129,7 +137,7 @@ class MetricSample {
     'rx_bytes_onwire', 'tx_bytes_onwire', 'payload_bytes', 'battery_pct', 'power_measured_mw',
     'power_model_mw', 'energy_model_j', 'energy_measured_j',
     'thermal_status', 'rssi_dbm', 'link_mbps', 'mem_free_mb', 'mem_total_mb', 'low_memory', 'charging',
-    'battery_temp_c',
+    'battery_temp_c', 'rx_packets_onwire', 'tx_packets_onwire',
   ];
 
   /// Flags are written 1/0 like on the wire; an unknown value is an empty cell.
@@ -137,7 +145,7 @@ class MetricSample {
         device, name, t, cpuPct, cpuNormPct, memMb, rxKBps, txKBps, rxBytes, txBytes, payloadBytes,
         battery, measuredMw, modelMw, energyModelJ, energyMeasuredJ,
         health?.thermalStatus, health?.rssiDbm, health?.linkMbps, health?.memFreeMb, health?.memTotalMb,
-        _flag(health?.lowMemory), _flag(health?.charging), health?.batteryTempC,
+        _flag(health?.lowMemory), _flag(health?.charging), health?.batteryTempC, rxPackets, txPackets,
       ];
 
   static int? _flag(bool? v) => v == null ? null : (v ? 1 : 0);
@@ -205,6 +213,38 @@ class UnitRecord {
       [deviceKey, jobId, unitIndex, bytes, downloadMs, inferMs, totalMs, downloadKBps, scheduler, t];
 }
 
+/// One scheduling decision: which phone was handed which units, and why.
+class DecisionRecord {
+  final int t; // host clock, epoch ms
+  final String deviceKey;
+  final String deviceName;
+  final List<int> units;
+  final String scheduler;
+
+  /// Health score of every phone the scheduler considered (0..1), if known.
+  final Map<String, double> healthByDevice;
+
+  DecisionRecord({
+    required this.t,
+    required this.deviceKey,
+    required this.deviceName,
+    required this.units,
+    required this.scheduler,
+    this.healthByDevice = const {},
+  });
+
+  static const csvHeader = ['time_ms', 'device', 'name', 'scheduler', 'units', 'health_by_device'];
+
+  List<Object?> csvCells() => [
+        t,
+        deviceKey,
+        deviceName,
+        scheduler,
+        units.join(' '),
+        healthByDevice.entries.map((e) => '${e.key}=${e.value}').join(' '),
+      ];
+}
+
 /// Everything recorded about one phone.
 class DeviceMetrics {
   final String key; // device IP
@@ -214,6 +254,26 @@ class DeviceMetrics {
   final Map<String, UnitRecord> units = {}; // keyed by job:unit so re-uploads de-duplicate
   Map<String, dynamic>? traffic; // TrafficCounter.toJson() (only when the phone uploaded a report)
   int lastSeen = 0;
+
+  /// Host clock minus this phone's clock, learned from its first sample, so
+  /// every phone can be drawn on one timeline. Zero for the local phone.
+  int? clockOffsetMs;
+
+  /// Host-clock times of this phone's assignment requests (capped).
+  final List<int> polls = [];
+
+  /// A sample time converted to the host's clock.
+  int hostTime(int sampleT) => sampleT + (clockOffsetMs ?? 0);
+
+  /// Median gap between the last few samples, in seconds (0 if fewer than 2).
+  double get sampleIntervalS {
+    if (samples.length < 2) return 0;
+    final from = samples.length > 11 ? samples.length - 11 : 0;
+    final gaps = <int>[
+      for (var i = from + 1; i < samples.length; i++) samples[i].t - samples[i - 1].t,
+    ]..sort();
+    return gaps[gaps.length ~/ 2] / 1000.0;
+  }
 
   DeviceMetrics(this.key, this.name, {this.isLocal = false});
 
@@ -234,6 +294,7 @@ class DeviceSummary {
   final int unitsDone;
   final double avgDownloadMs, avgInferMs, avgDownloadKBps;
   final int unitBytes;
+  final int rxPackets, txPackets; // on-wire packets over the recording window
 
   DeviceSummary({
     required this.key,
@@ -258,6 +319,8 @@ class DeviceSummary {
     required this.avgInferMs,
     required this.avgDownloadKBps,
     required this.unitBytes,
+    this.rxPackets = 0,
+    this.txPackets = 0,
   });
 
   int get onWireBytes => onWireRxBytes + onWireTxBytes;
@@ -274,14 +337,14 @@ class DeviceSummary {
     'avg_mem_mb', 'peak_mem_mb', 'onwire_rx_bytes', 'onwire_tx_bytes', 'payload_bytes', 'overhead_bytes',
     'overhead_pct', 'energy_model_j', 'avg_power_model_mw', 'energy_measured_j', 'avg_power_measured_mw',
     'battery_start', 'battery_end', 'units_done', 'unit_bytes', 'avg_download_ms', 'avg_infer_ms',
-    'avg_download_kBps',
+    'avg_download_kBps', 'rx_packets_onwire', 'tx_packets_onwire',
   ];
 
   List<Object?> csvCells() => [
         key, name, durationS, avgCpuPct, peakCpuPct, avgCpuNormPct, peakCpuNormPct, avgMemMb, peakMemMb,
         onWireRxBytes, onWireTxBytes, payloadBytes, overheadBytes, overheadPct, energyModelJ, avgPowerModelMw,
         energyMeasuredJ, avgMeasuredMw, batteryStart, batteryEnd, unitsDone, unitBytes, avgDownloadMs,
-        avgInferMs, avgDownloadKBps,
+        avgInferMs, avgDownloadKBps, rxPackets, txPackets,
       ];
 
   Map<String, dynamic> toJson() {
@@ -307,6 +370,40 @@ class MetricsStore extends ChangeNotifier {
 
   /// Which scheduling algorithm the host is running (labels exports).
   String schedulerId = '';
+
+  /// Scheduling decisions, newest last (capped).
+  final List<DecisionRecord> decisions = [];
+  static const int _maxDecisions = 500;
+
+  /// When the current experiment began (first assignment after a reset), host clock.
+  int? experimentStartMs;
+
+  void recordDecision(DecisionRecord d) {
+    experimentStartMs ??= d.t;
+    decisions.add(d);
+    if (decisions.length > _maxDecisions) decisions.removeAt(0);
+    notifyListeners();
+  }
+
+  /// Host side: a worker asked for work. Shows how often each phone polls.
+  void recordPoll(String deviceKey, {int? nowMs}) {
+    final d = deviceKey == local.key ? local : _remoteDevice(deviceKey, null);
+    d.polls.add(nowMs ?? DateTime.now().millisecondsSinceEpoch);
+    if (d.polls.length > 300) d.polls.removeAt(0);
+    notifyListeners();
+  }
+
+  /// Assignment requests in the last minute.
+  int pollsLastMinute(DeviceMetrics d, {int? nowMs}) {
+    final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    return d.polls.where((t) => now - t <= 60000).length;
+  }
+
+  /// Seconds since the last assignment request, or null if none yet.
+  double? lastPollAgeS(DeviceMetrics d, {int? nowMs}) {
+    if (d.polls.isEmpty) return null;
+    return ((nowMs ?? DateTime.now().millisecondsSinceEpoch) - d.polls.last) / 1000.0;
+  }
 
   void setLocalIdentity(String key, String name) {
     local = _rekey(local, key, name);
@@ -357,6 +454,7 @@ class MetricsStore extends ChangeNotifier {
       final d = _remoteDevice(key, j['name'] as String?);
       final s = MetricSample.fromWire(j);
       if (d.samples.isNotEmpty && s.t <= d.samples.last.t) return;
+      d.clockOffsetMs ??= DateTime.now().millisecondsSinceEpoch - s.t;
       d.samples.add(s);
       if (d.samples.length > _maxRemoteSamples) d.samples.removeAt(0);
       d.lastSeen = s.t;
@@ -397,6 +495,9 @@ class MetricsStore extends ChangeNotifier {
       }
     }
     if (report['traffic'] is Map) d.traffic = Map<String, dynamic>.from(report['traffic'] as Map);
+    if (d.clockOffsetMs == null && d.samples.isNotEmpty) {
+      d.clockOffsetMs = DateTime.now().millisecondsSinceEpoch - d.samples.last.t;
+    }
     d.lastSeen = DateTime.now().millisecondsSinceEpoch;
     notifyListeners();
   }
@@ -416,7 +517,10 @@ class MetricsStore extends ChangeNotifier {
   void clear() {
     local.samples.clear();
     local.units.clear();
+    local.polls.clear();
     _remote.clear();
+    decisions.clear();
+    experimentStartMs = null;
     TrafficCounter.instance.reset();
     notifyListeners();
   }
@@ -456,6 +560,8 @@ class MetricsStore extends ChangeNotifier {
       avgInferMs: u > 0 ? units.fold(0.0, (a, b) => a + b.inferMs) / u : 0,
       avgDownloadKBps: u > 0 ? units.fold(0.0, (a, b) => a + b.downloadKBps) / u : 0,
       unitBytes: units.fold(0, (a, b) => a + b.bytes),
+      rxPackets: (first != null && last != null) ? last.rxPackets - first.rxPackets : 0,
+      txPackets: (first != null && last != null) ? last.txPackets - first.txPackets : 0,
     );
   }
 
@@ -510,11 +616,35 @@ class MetricsStore extends ChangeNotifier {
       };
 
   /// Writes summary / samples / units CSVs and a JSON dump into [dir].
-  Future<List<File>> exportTo(Directory dir, {String? deviceKey}) async {
+  /// A user-typed file name made safe: no path separators or reserved characters,
+  /// no extension, never empty. [fallback] is used when nothing usable remains.
+  static String safeFileName(String? raw, {String fallback = 'experiment_metrics'}) {
+    var s = (raw ?? '').trim();
+    s = s.replaceAll(RegExp(r'\.(txt|csv|json)$', caseSensitive: false), '');
+    s = s.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').replaceAll(RegExp(r'\s+'), '_');
+    s = s.replaceAll(RegExp(r'^[._]+'), '');
+    if (s.length > 80) s = s.substring(0, 80);
+    return s.isEmpty ? fallback : s;
+  }
+
+  String decisionsCsv() {
+    final b = StringBuffer(_csvRow(DecisionRecord.csvHeader))..write('\n');
+    for (final d in decisions) {
+      b.write(_csvRow(d.csvCells()));
+      b.write('\n');
+    }
+    return b.toString();
+  }
+
+  /// Writes `<name>_summary.csv`, `_samples.csv`, `_units.csv`, `_decisions.csv` and `_full.json`.
+  /// [baseName] is the file name the user chose; without it a timestamped name is used.
+  Future<List<File>> exportTo(Directory dir, {String? deviceKey, String? baseName}) async {
     await dir.create(recursive: true);
     final stamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
     final scope = deviceKey == null ? 'all' : deviceKey.replaceAll('.', '-');
-    final prefix = 'metrics_${scope}_$stamp';
+    final prefix = baseName != null && baseName.trim().isNotEmpty
+        ? safeFileName(baseName)
+        : 'metrics_${scope}_$stamp';
     final files = <File>[];
     Future<void> write(String suffix, String content) async {
       final f = File('${dir.path}/${prefix}_$suffix');
@@ -525,6 +655,7 @@ class MetricsStore extends ChangeNotifier {
     await write('summary.csv', summaryCsv(deviceKey: deviceKey));
     await write('samples.csv', samplesCsv(deviceKey: deviceKey));
     await write('units.csv', unitsCsv(deviceKey: deviceKey));
+    await write('decisions.csv', decisionsCsv());
     await write('full.json', const JsonEncoder.withIndent('  ').convert(toJson(deviceKey: deviceKey)));
     return files;
   }

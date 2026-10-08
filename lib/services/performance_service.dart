@@ -213,6 +213,8 @@ class PerformanceService with WidgetsBindingObserver {
           rxBytes: currentMetrics['netRxBytes'] ?? 0,
           txBytes: currentMetrics['netTxBytes'] ?? 0,
           payloadBytes: TrafficCounter.instance.totalPayload,
+          rxPackets: currentMetrics['netRxPackets'] ?? 0,
+          txPackets: currentMetrics['netTxPackets'] ?? 0,
           battery: currentBattery,
           measuredMw: measuredPowerMw,
           modelMw: modelMw,
