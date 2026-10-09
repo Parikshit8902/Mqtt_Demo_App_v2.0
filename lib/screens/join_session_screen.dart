@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import '../services/mqtt_service.dart';
 import '../services/network_helper.dart';
 import '../services/broker_discovery_service.dart';
+import '../services/session_link.dart';
+import 'scan_session_screen.dart';
 import '../widgets/broker_selection_widget.dart';
 import '../widgets/message_log.dart';
 import '../widgets/file_download_widget.dart';
@@ -24,6 +26,7 @@ class JoinSessionScreen extends StatefulWidget {
 
 class _JoinSessionScreenState extends State<JoinSessionScreen> {
   final TextEditingController _brokerIpController = TextEditingController();
+  final TextEditingController _pinController = TextEditingController();
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final BrokerDiscoveryService _discoveryService = BrokerDiscoveryService();
@@ -44,6 +47,7 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
   void dispose() {
     widget.mqttService.removeListener(_onMqttServiceChanged);
     _brokerIpController.dispose();
+    _pinController.dispose();
     _messageController.dispose();
     _scrollController.dispose();
     _discoveryService.dispose();
@@ -92,7 +96,7 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
       return;
     }
 
-    final success = await widget.mqttService.connect(brokerIp);
+    final success = await widget.mqttService.connect(brokerIp, pin: _pinController.text);
     
     setState(() {
       _isConnecting = false;
@@ -106,9 +110,21 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
       await widget.mqttService.subscribe();
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to connect to session')),
+        const SnackBar(content: Text('Failed to connect to session. Check the PIN shown on the host and that both phones are on the same Wi-Fi.')),
       );
     }
+  }
+
+  /// Join by scanning the QR code on the host's session screen: it carries
+  /// the host's address and the session PIN.
+  Future<void> _scanQr() async {
+    final link = await Navigator.of(context).push<SessionLink>(
+      MaterialPageRoute(builder: (_) => const ScanSessionScreen()),
+    );
+    if (link == null || !mounted) return;
+    _brokerIpController.text = link.host;
+    if (link.pin != null) _pinController.text = link.pin!;
+    await _connect(link.host);
   }
 
   Future<void> _disconnect() async {
@@ -228,9 +244,26 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
                 children: [
                   const Divider(height: 1),
                   const SizedBox(height: 20),
+                  TextField(
+                    controller: _pinController,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    decoration: const InputDecoration(
+                      labelText: 'Session PIN',
+                      helperText: 'Shown on the host phone',
+                      counterText: '',
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   Text(
                     'Available Sessions',
                     style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 16),
+                  OutlinedButton.icon(
+                    onPressed: _scanQr,
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: const Text('Scan the host\'s QR code'),
                   ),
                   const SizedBox(height: 16),
                   BrokerSelectionWidget(

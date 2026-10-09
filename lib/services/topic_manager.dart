@@ -178,6 +178,12 @@ class TopicManager extends ChangeNotifier {
       'isDefault': false,
       'isSystem': true,
     },
+    'work/available': {
+      'displayName': 'Work Available',
+      'description': 'Host tells idle workers a job has units to hand out (sends the job id)',
+      'isDefault': false,
+      'isSystem': true,
+    },
   };
 
   TopicManager() {

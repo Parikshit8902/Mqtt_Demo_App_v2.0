@@ -23,6 +23,8 @@ These two modes let you test sending and receiving messages between multiple dev
 3. On Device B (a client):
   - Tap "Become MQTT Client".
   - Use the automatic search (magnifier icon) to find the broker shown by Device A, or type that IP address into the broker field.
+  - Easiest: tap **Scan the host's QR code** and point the camera at the code on Device A's session screen (it carries the address and PIN).
+  - Or type the 6-digit session PIN shown on Device A (every hosted session gets a new one), then pick the session.
   - Tap "Connect" and then tap "Subscribe" to start receiving messages.
 4. On Device B, tap "Publish Message" to send a test message — both devices should show the message in the log.
 
@@ -37,6 +39,28 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 - The app also includes a screen that can download a small machine learning model and a sample dataset and run local tests (this is optional).
 - This screen is mainly for testing and learning how models perform on the device; you can also export detection results if you try it.
 
+## Metrics, export and scheduling (for experiments)
+- Open **Analytics → chart icon** to see per-phone CPU, memory, network, power, battery and per-image timings, plus how much data was real payload versus protocol overhead.
+- **Export** writes `summary.csv`, `samples.csv`, `units.csv` and `full.json`. On the broker phone it covers every phone; on a worker it covers that phone. Android: `Android/data/com.example.mqtt_demo/files/metrics_exports`; iOS: the app's folder in the Files app.
+- Workers send their full recording to the broker phone automatically when their work runs dry (or press **Send report to host**).
+- From a laptop on the same Wi-Fi add the session PIN to admin URLs (`&pin=123456`, or a `?pin=` if the URL has no other parameters): `http://<broker-ip>:8080/admin/metrics.csv?kind=summary|samples|units|runs` (optionally `&device=<phone-ip>`; `runs` has one row per run with makespan, throughput, p50/p95 latency, Jain's fairness and energy per image, for comparing schedulers), or `/admin/metrics.json` for JSON (`/admin/metrics` is the plain-text experiment report with its Download button).
+- Pick the scheduling algorithm in the metrics screen (broker phone), or `curl -X POST http://<broker-ip>:8080/admin/scheduler -d '{"id":"round_robin"}'`. New algorithms are registered in `lib/services/schedulers/scheduler_registry.dart`.
+- Power is an estimate; see `PROPOSAL.md` for what is measured, what is modelled, and the iOS limits.
+
+- **Image size sent:** on the host, *Image size sent* (max longer side) and *JPEG quality* make the host serve scaled-down / re-encoded copies of the dataset images (made once, in the background). The schedulers see the smaller sizes; the setting is shown in the report and in the `images` column of `runs.csv`, so accuracy, bandwidth and energy can be compared across settings. Also `image_max_side` / `image_quality` in `POST /admin/job_options`.
+- **Experiment runner:** after sharing the model and dataset, the host's Metrics screen can run the selected schedulers N times each, interleaved (A B C, A B C …). Each run is reset, started, waited on until every image is done (or a time limit passes), and saved as its own files (`<name>_NN_<scheduler>_rK_*.csv`, `_report.txt`), plus `<name>_runs.csv` with one comparison row per run.
+- **Timeline:** the host's Metrics screen draws one row per phone with a bar per image (grey = download, black = inference) on the host's clock. Unit times in the exports are on the host's clock too.
+- **Fault injection:** on the host's Metrics screen, each worker can be **dropped** (gets no work; its results, uploads and health are refused, so its units come back when their 60 s leases expire, as for a crashed phone), given an extra **delay** on assignments and downloads, or a download **speed cap**. Faults are listed in report section 11 and cleared by a reset. From a laptop: `POST /admin/faults {"device": "<phone-ip>", "drop": true, "delay_ms": 1000, "bandwidth_kBps": 200}` (`{"device": ..., "clear": true}` or `{"clear_all": true}` to undo).
+- **Accuracy:** put YOLO label files in the dataset ZIP (`images/x.jpg` with `labels/x.txt`, or `x.txt` beside the image; class names from `classes.txt`, a `*.names` file or `data.yaml`, otherwise COCO's). The report then scores the finished images: precision, recall and mAP@0.5. Also at `/admin/accuracy`.
+
+## Dynamic scheduling (Greedy, PSO, MOMPSO, MOMPSO-GA)
+All four schedulers now decide from live data instead of two static numbers. The host sees, per worker: CPU load, free RAM, battery and charging, thermal status, Wi-Fi signal (Android), measured bandwidth and inference time, queue depth, recent latency and a power class by device model. Workers report health every 5 s over MQTT and with every finished unit.
+- **Shared model** (`lib/services/schedulers/scheduling_model.dart`): the health score is the DetectNet `hScore` formula driven by live values; thermal, battery, memory, Wi-Fi signal and recently failed units derate a phone's capacity; phones at <=5% battery (unplugged), critical thermal state, low memory or repeatedly failed units (timeouts or reported errors) get no new work (unless every phone is in that state); each assignment lengthens that phone's queue, which spreads a batch.
+- **Algorithms** keep the structure of the `Parikshit` versions and DetectNet: Greedy = earliest estimated finish; PSO = lightweight swarm over health scores; MOMPSO = weighted health / latency / queue / energy; MOMPSO-GA = MOMPSO plus 70/30 blend and mutation. Default MOMPSO weights are the DetectNet ones scaled by 0.8 with 0.2 for energy (`ObjectiveWeights`).
+- **Batch size:** each request gets a fixed number of units (Units per assignment). With **Adaptive batch size** on, a request gets about the units still left divided by twice the number of active phones, capped by Units per assignment: large batches early, single units near the end. Also settable with `POST /admin/job_options {"job_id": ..., "adaptive_batch": true}`.
+- **Robustness:** units not finished within 60 s are requeued; a worker whose download or inference fails reports it and the unit is requeued at once (a failure is never counted as a finished image), and a unit that fails 3 times is skipped so the job can finish; silent phones are dropped from planning; a shared dataset ZIP is extracted once and images are served from disk; idle workers poll every 2 s doubling to 16 s, and the host wakes them on the `work/available` MQTT topic when work appears; while a phone hosts or works, its screen stays on, metrics keep sampling, and on Android a foreground service (with a notification) plus CPU and Wi-Fi locks keep the run going if the screen turns off or the app is sent to the background; `/admin/scheduler_logs` entries include a per-phone trace of why work went where.
+- **Limits:** PSO and MOMPSO-GA are DetectNet's heuristics (PSO's fitness reduces to ranking by health; GA's closest-to-blend pick selects the top mutated score), not literature-faithful multi-objective PSO/GA. The thresholds in `HealthPolicy` are heuristics to calibrate. CPU load is the app's own process CPU. The Android code now builds (`flutter build apk --debug`) but has not been tested on a device here.
+
 ## Basic troubleshooting (non-technical)
 - If you can't connect, make sure both devices are on the same Wi‑Fi network.
 - Check the IP address shown on the broker device and enter it exactly on the client device.
@@ -46,6 +70,7 @@ Tip: You can repeat the client steps for Device C, Device D, etc., so many devic
 ## Safety & privacy notes (important for anyone)
 - The app uses your local Wi‑Fi. Files and messages stay inside your local network unless you deliberately share them outside.
 - Do not share the broker IP on public networks you don't control.
+- Each hosted session has a 6-digit PIN. Without it, other phones on the Wi-Fi cannot join the broker or use the host's admin and assignment endpoints (reset, scheduler, results). File links stay reachable to anyone who has one; they are random and only announced inside the session.
 
 ---
 
@@ -57,6 +82,7 @@ If you are curious or want to run the project from source, here are a few short 
 - To run from source:
   1. Install Flutter and set up your platform (Android or iOS).
   2. In the project folder run: `flutter pub get` then `flutter run`.
+- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request, and builds the Android release APKs (`flutter build apk --release --split-per-abi`, needs a Java 17 JDK). To install the app, open the latest CI run on GitHub (Actions tab), and download **mqtt-demo-apk-arm64** from the Artifacts list at the bottom of its Summary page (the arm32 one is only for old phones). Unzip it and open the APK on the phone (allow installing from this source when asked).
 
 If you'd like, we can add back a full developer section with dependency versions and code structure.
 

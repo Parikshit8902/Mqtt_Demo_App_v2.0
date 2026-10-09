@@ -1,4 +1,5 @@
 import 'message_logger.dart';
+import 'metrics/metrics_store.dart';
 import 'models/assignment.dart';
 import 'models/result_dto.dart';
 import 'utils/http_helper.dart';
@@ -21,6 +22,8 @@ class AssignmentsClient {
   }
 
   Future<PerClientAssignment?> requestNext(String jobId, String clientId) async {
+    // Counted here so the worker's own screen can show how often it polls.
+    MetricsStore.instance.recordPoll(MetricsStore.instance.local.key);
     try {
       final url = Uri.parse('$serverBase/assignments/$jobId/next?for=$clientId');
       final j = await httpGetJson(url);
@@ -30,6 +33,16 @@ class AssignmentsClient {
       _logger.log('⚠️ requestNext error: $e');
     }
     return null;
+  }
+
+  Future<bool> postMetricsReport(Map<String, dynamic> report) async {
+    try {
+      await httpPostJson(Uri.parse('$serverBase/admin/metrics_report'), report);
+      return true;
+    } catch (e) {
+      _logger.log('⚠️ postMetricsReport error: $e');
+    }
+    return false;
   }
 
   Future<bool> postResult(ResultReport rr) async {

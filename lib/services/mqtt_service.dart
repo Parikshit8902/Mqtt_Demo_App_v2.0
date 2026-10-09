@@ -17,6 +17,13 @@ import 'topic_manager.dart';
 import 'network_helper.dart';
 import 'client_metrics_publisher.dart';
 import 'performance_service.dart';
+import 'session_auth.dart';
+import 'device_info_helper.dart';
+import 'distribution_singleton.dart';
+import 'fault_injector.dart';
+import 'metrics/metrics_store.dart';
+import 'metrics/traffic_counter.dart';
+import 'models/device_health.dart';
 
 /// Main MQTT service that orchestrates client and broker operations
 class MqttService extends ChangeNotifier {
@@ -54,15 +61,59 @@ class MqttService extends ChangeNotifier {
       onStateChanged: notifyListeners,
     );
     _fileServerService = FileServerService(_logger, onStateChanged: notifyListeners);
+    _fileServerService.onWorkAvailable = announceWorkAvailable;
     _fileDownloadService = FileDownloadService(_logger, onStateChanged: notifyListeners);
     
     // Listen to client tracker changes
     _clientTracker.addListener(notifyListeners);
     // Listen to topic manager changes
     _topicManager.addListener(notifyListeners);
+    // Feed every worker's periodic metrics into the store (only the broker host
+    // subscribes to this topic, so this is a no-op on workers).
+    addMessageListener('clients/metrics', (topic, message) => MetricsStore.instance.ingestWire(message));
+    // The same samples tell the scheduler how each phone is doing right now.
+    addMessageListener('clients/metrics', _feedSchedulerHealth);
+  }
+
+  /// Host only: the job the shared dataset is registered under.
+  String get currentJobId => _fileServerService.currentJobId;
+
+  /// Host only: clear the current experiment (see FileServerService).
+  void resetExperiment() => _fileServerService.resetExperiment();
+
+  /// Topic on which the host tells idle workers that a job has units to hand
+  /// out, so they ask now instead of waiting out their polling backoff.
+  static const String workAvailableTopic = 'work/available';
+
+  /// Host only: announce that [jobId] has work (a job was registered or
+  /// reactivated, or a failed unit went back to the pool).
+  Future<void> announceWorkAvailable(String jobId) async {
+    if (!_brokerMonitoringClientConnected) return;
+    await _clientManager.publishMessage(message: jobId, topic: workAvailableTopic);
+  }
+
+  /// Hand a worker's live health (battery, thermal, RAM, Wi-Fi, CPU) to the
+  /// distribution manager. Samples are keyed by device IP, which it matches
+  /// against the registered client ids.
+  void _feedSchedulerHealth(String topic, String message) {
+    try {
+      final j = jsonDecode(message);
+      if (j is! Map<String, dynamic>) return;
+      final key = j['i'];
+      if (key is! String || key.isEmpty) return;
+      // A phone dropped by fault injection must look silent to the scheduler.
+      if (FaultInjector.instance.isDropped(key)) return;
+      distributionManager.updateClientHealth(
+        key,
+        DeviceHealth.fromWire(j, updatedAtMs: DateTime.now().millisecondsSinceEpoch),
+      );
+    } catch (_) {
+      // A malformed sample is dropped; the next one arrives within seconds.
+    }
   }
   
   // Getters
+  MessageLogger get messageLogger => _logger;
   MqttClientManager get clientManager => _clientManager;
   bool get isConnected => _clientManager.isConnected;
   bool get isSubscribed => _clientManager.isSubscribed;
@@ -127,10 +178,29 @@ class MqttService extends ChangeNotifier {
   }
   
   // MQTT Broker functionality
+  /// The PIN workers must enter to join this session (host), or the one
+  /// entered to join (worker). Null when none is set.
+  String? get sessionPin => SessionAuth.pin;
+
   Future<bool> startBroker() async {
-    final success = await _brokerManager.startBroker();
+    // Every hosted session gets a fresh PIN: the broker, and the admin and
+    // assignment endpoints, refuse other phones on the Wi-Fi without it.
+    SessionAuth.pin = SessionAuth.generatePin();
+    _fileServerService.requiredPin = SessionAuth.pin;
+    final success = await _brokerManager.startBroker(pin: SessionAuth.pin);
     
     if (success) {
+      // PerformanceService is a lazy singleton: touch it so the host records its own
+      // metrics from the start instead of waiting for the Analytics tab to open.
+      PerformanceService.instance;
+      // Label this phone's own recording so it shows up by IP/name in exports
+      final hostIp = await NetworkHelper.getDeviceIPAddress();
+      if (hostIp != null) {
+        MetricsStore.instance.setLocalIdentity(hostIp, (await DeviceInfoHelper.getDeviceName()) ?? 'Host');
+      }
+      // The host phone must stay awake to serve files and assignments, and its
+      // own metrics should have no gaps while it does.
+      PerformanceService.instance.beginRun('host');
       // Connect a local client for the host to be able to publish messages
       await _setupHostPublishingClient();
       
@@ -173,6 +243,7 @@ class MqttService extends ChangeNotifier {
   }
   
   Future<void> stopBroker() async {
+    PerformanceService.instance.endRun('host');
     // Stop the file server
     await _fileServerService.stopServer();
     
@@ -183,10 +254,15 @@ class MqttService extends ChangeNotifier {
     }
     
     await _brokerManager.stopBroker();
+    SessionAuth.pin = null;
+    _fileServerService.requiredPin = null;
   }
   
   /// Connect to MQTT broker as a client
-  Future<bool> connect(String brokerIp) async {
+  /// Join the session at [brokerIp]; [pin] is the one the host shows.
+  Future<bool> connect(String brokerIp, {String? pin}) async {
+    final typed = pin?.trim();
+    SessionAuth.pin = (typed == null || typed.isEmpty) ? null : typed;
     final success = await _clientManager.connect(brokerIp);
     
     if (success) {
@@ -202,6 +278,10 @@ class MqttService extends ChangeNotifier {
   await _clientManager.subscribeToTopic('dist/data');
   addMessageListener('dist/mod', _handleDistributedShare);
   addMessageListener('dist/data', _handleDistributedShare);
+
+  // The host announces new work here; an idle worker then asks right away.
+  await _clientManager.subscribeToTopic(workAvailableTopic);
+  addMessageListener(workAvailableTopic, (topic, message) => _clientWorkerService?.nudge());
       
       // Start client metrics publishing
       startClientMetricsPublishing();
@@ -257,10 +337,14 @@ class MqttService extends ChangeNotifier {
                   'client_id': _clientManager.clientId,
                   'ttproc_ms': res.ttprocMs.round(),
                   'bandwidth_kBps': res.bandwidthKBps,
+                  'model': modelFile.path.split(RegExp(r'[\\/]')).last,
                   'warmup': true,
                 });
                 try {
-                  await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
+                  await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json', ...SessionAuth.headers}, body: body);
+                  TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
+                  TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
+                  TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
                   _logger.log('✅ Posted warmup results to host: $postUrl');
                   // Start client worker to fetch assignments and run inference on assigned units
                   try {
@@ -268,6 +352,8 @@ class MqttService extends ChangeNotifier {
                     final assignClient = AssignmentsClient(_logger, serverBase: serverBase);
                     final inference = InferenceService(modelPath: modelFile.path);
                     final jobId = shareInfo.fileId.isNotEmpty ? shareInfo.fileId : 'demo_job';
+                    // A new dataset replaces the previous job; two workers must not run at once.
+                    _clientWorkerService?.stop();
                     _clientWorkerService = ClientWorkerService(_logger, assignClient, inference, jobId: jobId, clientId: _clientManager.clientId);
                     // start worker without awaiting to keep UI responsive
                     _clientWorkerService!.start();
@@ -396,6 +482,9 @@ class MqttService extends ChangeNotifier {
   }
   
   Future<void> disconnect() async {
+    // A worker left running would keep polling the host and keep the screen on.
+    _clientWorkerService?.stop();
+    _clientWorkerService = null;
     // Stop client metrics publishing
     stopClientMetricsPublishing();
     await _clientManager.disconnect();
@@ -577,6 +666,9 @@ class MqttService extends ChangeNotifier {
   
   /// Get server URL for file sharing
   String get serverUrl => _fileServerService.networkServerUrl;
+
+  /// Host only: this phone's address on the Wi-Fi, which other phones join.
+  String get hostLanIp => _fileServerService.networkAccessibleIp;
   
   /// Process incoming file share message - deprecated but kept for compatibility
   Future<FileDownloadTask?> processFileShareMessage(String message) async {
@@ -691,9 +783,20 @@ class MqttService extends ChangeNotifier {
     notifyListeners();
   }
   
+  // Disposing stops the broker and file server, which finish asynchronously
+  // and report their state change after this service is gone.
+  bool _disposed = false;
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
   @override
   void dispose() {
+    _disposed = true;
     _logger.log('🧹 Disposing MqttService');
+    _clientWorkerService?.stop();
     _clientTracker.removeListener(notifyListeners);
     _clientManager.dispose();
     _brokerManager.dispose();

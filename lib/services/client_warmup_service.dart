@@ -1,9 +1,9 @@
 import 'package:http/http.dart' as http;
-import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'message_logger.dart';
 import 'inference_service.dart';
 import 'utils/metrics.dart';
+import 'metrics/traffic_counter.dart';
 
 class WarmupResult {
   final double ttprocMs;
@@ -37,6 +37,9 @@ class ClientWarmupService {
       }
 
       final bytes = resp.bodyBytes;
+      TrafficCounter.instance.addRx(TrafficChannel.httpData, bytes.length);
+      TrafficCounter.instance.countTxMsg(TrafficChannel.httpData);
+      TrafficCounter.instance.countRxMsg(TrafficChannel.httpData);
       // If the warmup bundle is a ZIP, try to extract a first compatible image
       List<int> imageBytes = bytes;
       try {

@@ -5,6 +5,8 @@ import 'package:mqtt_client/mqtt_server_client.dart';
 import 'message_logger.dart';
 import 'device_info_helper.dart';
 import 'network_helper.dart';
+import 'metrics/traffic_counter.dart';
+import 'session_auth.dart';
 
 /// Manages MQTT client connections and operations
 class MqttClientManager {
@@ -87,10 +89,15 @@ class MqttClientManager {
       
       // Create connection message
       _logger.log('📝 Creating connection message');
-      final connMess = MqttConnectMessage()
+      var connMess = MqttConnectMessage()
           .withClientIdentifier(_clientId)
           .startClean()
           .withWillQos(MqttQos.atLeastOnce);
+      // A session that requires a PIN only accepts this login.
+      final pin = SessionAuth.pin;
+      if (pin != null && pin.isNotEmpty) {
+        connMess = connMess.authenticateAs(SessionAuth.mqttUsername, pin);
+      }
       
       _client!.connectionMessage = connMess;
       
@@ -111,12 +118,22 @@ class MqttClientManager {
         // Set up message listener
         _logger.log('👂 Setting up message listener');
         _client!.updates!.listen((List<MqttReceivedMessage<MqttMessage?>>? messages) async {
-          if (messages != null && messages.isNotEmpty) {
-            final recMess = messages[0].payload as MqttPublishMessage;
+          if (messages == null) return;
+          // A single update can carry several messages; handle every one of them.
+          for (final received in messages) {
+            final recMess = received.payload as MqttPublishMessage;
             final message = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
-            final topic = messages[0].topic;
+            final topic = received.topic;
             // _logger.log('📨 Received message: "$message" from topic: $topic');
-            
+
+            final payloadBytes = recMess.payload.message.length;
+            TrafficCounter.instance.addRx(
+              topic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt,
+              payloadBytes,
+            );
+            TrafficCounter.instance.countRxMsg(topic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt);
+            TrafficCounter.instance.mqttFramingRx += TrafficCounter.mqttFraming(topic, payloadBytes);
+
             // Process message based on topic
             await _processIncomingMessage(topic, message);
           }
@@ -244,6 +261,13 @@ class MqttClientManager {
         
         // Publish message
         _client!.publishMessage(pubTopic, MqttQos.atMostOnce, builder.payload!);
+        final sentBytes = builder.payload!.length;
+        TrafficCounter.instance.addTx(
+          pubTopic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt,
+          sentBytes,
+        );
+        TrafficCounter.instance.countTxMsg(pubTopic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt);
+        TrafficCounter.instance.mqttFramingTx += TrafficCounter.mqttFraming(pubTopic, sentBytes);
         // _logger.log('🚀 Message published successfully');
         
         _onStateChanged?.call();

@@ -435,10 +435,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.TrafficStats
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.PowerManager
 import android.system.Os
 import android.system.OsConstants
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -447,6 +450,10 @@ import java.lang.Exception
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.mqtt_demo/performance"
+
+    // WifiInfo.INVALID_RSSI is a hidden API, so its value is spelled out here.
+    private val INVALID_RSSI_DBM = -127
+    private val BYTES_PER_MB = 1024.0 * 1024.0
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -473,6 +480,56 @@ class MainActivity: FlutterActivity() {
                 }
 
                 // --- REAL-TIME DATA METHODS ---
+                // Battery current x voltage gives whole-device power draw. Only meaningful
+                // while unplugged; the sign and unit of CURRENT_NOW vary by vendor, so the
+                // raw value is returned and interpreted on the Dart side.
+                "getPowerDetails" -> {
+                    try {
+                        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                        val status: Intent? = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                        val plugged = status?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+                        val info = mutableMapOf<String, Any>(
+                            "currentNow" to bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW),
+                            "chargeCounterUah" to bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER),
+                            "voltageMv" to (status?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0),
+                            "charging" to (plugged != 0)
+                        )
+                        result.success(info)
+                    } catch (e: Exception) {
+                        result.error("POWER_ERROR", "Failed to read power details", e.localizedMessage)
+                    }
+                }
+
+                // Live device state for the dynamic schedulers (memory, thermal, charging, Wi-Fi link).
+                "getDeviceHealth" -> result.success(deviceHealth())
+
+                // Keeps the screen on while an experiment runs, so the app stays in the
+                // foreground and its sampling timer is not stopped or frozen.
+                "setKeepScreenOn" -> {
+                    if (call.argument<Boolean>("on") == true) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    result.success(null)
+                }
+
+                // Keeps an experiment running with the screen off (see RunService).
+                // Starting can be refused when the app is not in the foreground.
+                "startRunService" -> {
+                    try {
+                        RunService.start(this, call.argument<String>("text") ?: "Experiment running")
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+
+                "stopRunService" -> {
+                    RunService.stop(this)
+                    result.success(null)
+                }
+
                 "getBatteryDetails" -> {
                     val iFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                     val batteryStatus: Intent? = context.registerReceiver(null, iFilter)
@@ -519,6 +576,9 @@ class MainActivity: FlutterActivity() {
                     // This is the correct way and works for both local Wi-Fi and internet.
                     metrics["netRxBytes"] = TrafficStats.getUidRxBytes(uid) // Received bytes
                     metrics["netTxBytes"] = TrafficStats.getUidTxBytes(uid) // Transmitted bytes
+                    // Packets let the report compare "messages the app sent" with what hit the wire.
+                    metrics["netRxPackets"] = TrafficStats.getUidRxPackets(uid)
+                    metrics["netTxPackets"] = TrafficStats.getUidTxPackets(uid)
 
                     result.success(metrics)
                 }
@@ -568,5 +628,53 @@ class MainActivity: FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    // Each sensor is read in isolation so one that is missing or throws (vendor quirks,
+    // a revoked permission) does not drop the others. A key is omitted rather than
+    // guessed whenever its source is unavailable; the Dart side treats absent as unknown.
+    private fun deviceHealth(): Map<String, Any> {
+        val health = mutableMapOf<String, Any>()
+
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mem = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mem)
+            health["memFreeMb"] = mem.availMem / BYTES_PER_MB
+            health["memTotalMb"] = mem.totalMem / BYTES_PER_MB
+            health["lowMemory"] = mem.lowMemory
+        } catch (e: Exception) { /* memory keys stay absent */ }
+
+        try {
+            // ACTION_BATTERY_CHANGED is sticky: a null receiver just returns the last broadcast.
+            val battery: Intent? = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (battery != null) {
+                // The platform reports temperature in tenths of a degree Celsius.
+                val tenthsC = battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+                if (tenthsC != Int.MIN_VALUE) health["batteryTempC"] = tenthsC / 10.0
+                val plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
+                if (plugged >= 0) health["charging"] = plugged != 0
+            }
+        } catch (e: Exception) { /* battery keys stay absent */ }
+
+        // getCurrentThermalStatus() only exists from API 29; older devices omit the key.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                health["thermalStatus"] = pm.currentThermalStatus
+            } catch (e: Exception) { /* thermal key stays absent */ }
+        }
+
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            // Deprecated since API 31, but it still returns RSSI and link speed for the app's
+            // own connection; only SSID/BSSID-style fields are redacted without location access.
+            @Suppress("DEPRECATION")
+            val link = wifi.connectionInfo
+            if (link.rssi != INVALID_RSSI_DBM) health["rssiDbm"] = link.rssi
+            if (link.linkSpeed > 0) health["linkMbps"] = link.linkSpeed
+        } catch (e: Exception) { /* Wi-Fi keys stay absent */ }
+
+        return health
     }
 }

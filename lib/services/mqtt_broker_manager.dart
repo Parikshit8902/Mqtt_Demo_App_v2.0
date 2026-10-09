@@ -5,6 +5,7 @@ import 'package:mqtt_server/mqtt_server.dart';
 import 'message_logger.dart';
 import 'udp_broadcast_manager.dart';
 import 'client_tracker.dart';
+import 'session_auth.dart';
 
 /// Manages MQTT broker operations
 class MqttBrokerManager {
@@ -16,6 +17,9 @@ class MqttBrokerManager {
   bool _isBrokerRunning = false;
   MqttServerClient? _brokerMonitorClient;
   UdpBroadcastManager? _udpBroadcastManager;
+
+  // The session PIN the running broker requires, or null when it is open.
+  String? _pin;
   
   MqttBrokerManager(this._logger, this._clientTracker, {Function()? onStateChanged}) 
     : _onStateChanged = onStateChanged;
@@ -23,8 +27,9 @@ class MqttBrokerManager {
   /// Get broker running status
   bool get isBrokerRunning => _isBrokerRunning;
   
-  /// Start MQTT broker
-  Future<bool> startBroker() async {
+  /// Start MQTT broker. With a [pin], only clients logging in with it (see
+  /// SessionAuth) may connect; without one the broker is open.
+  Future<bool> startBroker({String? pin}) async {
     _logger.log('🚀 Starting MQTT broker...');
     try {
       // Stop existing broker if running
@@ -37,16 +42,19 @@ class MqttBrokerManager {
       await _udpBroadcastManager?.stopBroadcast();
       
       // Create broker configuration
-      _logger.log('⚙️  Creating broker configuration (port: 1883, anonymous: true)');
+      final open = pin == null || pin.isEmpty;
+      _pin = open ? null : pin;
+      _logger.log('⚙️  Creating broker configuration (port: 1883, ${open ? 'open' : 'session PIN required'})');
       final config = MqttBrokerConfig(
         port: 1883,
-        allowAnonymous: true,
+        allowAnonymous: open,
         enablePersistence: false,
       );
       
       // Create and start broker
       _logger.log('🔧 Creating broker instance');
       _broker = MqttBroker(config);
+      if (!open) _broker!.addCredentials(SessionAuth.mqttUsername, pin);
       
       // Set up client connection tracking
       _setupClientTracking();
@@ -131,10 +139,12 @@ class MqttBrokerManager {
       _brokerMonitorClient!.setProtocolV311();
       
       // Set up connection message
-      final connMess = MqttConnectMessage()
+      var connMess = MqttConnectMessage()
           .withClientIdentifier(monitorClientId)
           .startClean()
           .withWillQos(MqttQos.atLeastOnce);
+      final pin = _pin;
+      if (pin != null) connMess = connMess.authenticateAs(SessionAuth.mqttUsername, pin);
       
       _brokerMonitorClient!.connectionMessage = connMess;
       
