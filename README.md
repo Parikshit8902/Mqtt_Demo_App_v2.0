@@ -82,7 +82,7 @@ If you are curious or want to run the project from source, here are a few short 
 - To run from source:
   1. Install Flutter and set up your platform (Android or iOS).
   2. In the project folder run: `flutter pub get` then `flutter run`.
-- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request, and builds a debug APK so the Android code is compiled too (`flutter build apk --debug` needs a Java 17 JDK).
+- Checks: `flutter analyze --no-fatal-infos` and `flutter test`. CI (`.github/workflows/ci.yml`) runs both on every push and pull request, and builds the Android release APKs (`flutter build apk --release --split-per-abi`, needs a Java 17 JDK). To install the app, open the latest CI run on GitHub (Actions tab), and download **mqtt-demo-apk-arm64** from the Artifacts list at the bottom of its Summary page (the arm32 one is only for old phones). Unzip it and open the APK on the phone (allow installing from this source when asked).
 
 If you'd like, we can add back a full developer section with dependency versions and code structure.
 

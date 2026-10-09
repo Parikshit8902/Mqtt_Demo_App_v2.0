@@ -23,7 +23,8 @@ jobs:
 
       - run: flutter test
 
-  # Compiles the Kotlin side (channels, foreground service) and the plugins.
+  # Compiles the Kotlin side (channels, foreground service) and the plugins,
+  # and keeps the installable APKs on the run's Summary page for 30 days.
   build-android:
     runs-on: ubuntu-latest
     steps:
@@ -42,4 +43,19 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build apk --debug
+      # Release builds run at full speed (debug Dart is much slower), so these
+      # are the ones to measure with. Signed with the debug key: fine for
+      # installing on test phones, not for a store.
+      - run: flutter build apk --release --split-per-abi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mqtt-demo-apk-arm64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mqtt-demo-apk-arm32-older-phones
+          path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          retention-days: 30
