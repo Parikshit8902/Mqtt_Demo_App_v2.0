@@ -44,6 +44,16 @@ abstract class DynamicScheduler implements Scheduler {
   /// units in the order given and use [pick].
   UnitPick? pickPair(FleetModel fleet, List<Unit> remaining, List<String> open) => null;
 
+  /// Optional whole-batch plan. The plan is computed once from the initial
+  /// fleet snapshot; the base class still validates every pair and records
+  /// assignments through [FleetModel]. Returning null preserves incremental
+  /// scheduling for existing schedulers.
+  List<UnitPick>? planBatch(
+    FleetModel fleet,
+    List<Unit> remaining,
+    List<String> open,
+  ) => null;
+
   @override
   Map<String, List<Unit>> schedule(
     List<Unit> availableUnits,
@@ -58,6 +68,11 @@ abstract class DynamicScheduler implements Scheduler {
 
     final fleet = FleetModel(clients, availableUnits, maxUnitPerAssign, cfg: config);
     final remaining = List<Unit>.from(availableUnits);
+    final initialOpen = fleet.eligibleIds
+        .where((c) => assignments[c]!.length < fleet.capFor(c))
+        .toList();
+    final batchPlan = planBatch(fleet, List<Unit>.unmodifiable(remaining), List<String>.unmodifiable(initialOpen));
+    var batchPlanIndex = 0;
 
     while (remaining.isNotEmpty) {
       final open = fleet.eligibleIds.where((c) => assignments[c]!.length < fleet.capFor(c)).toList();
@@ -65,8 +80,18 @@ abstract class DynamicScheduler implements Scheduler {
 
       final Unit unit;
       final String winner;
-      final pair = pickPair(fleet, remaining, open);
-      if (pair != null) {
+      UnitPick? pair;
+      if (batchPlan != null) {
+        while (batchPlanIndex < batchPlan.length) {
+          final candidate = batchPlan[batchPlanIndex++];
+          if (remaining.contains(candidate.unit) && open.contains(candidate.client)) {
+            pair = candidate;
+            break;
+          }
+        }
+      }
+      pair ??= pickPair(fleet, remaining, open);
+      if (pair != null && remaining.contains(pair.unit) && open.contains(pair.client)) {
         unit = pair.unit;
         winner = pair.client;
         remaining.remove(unit);

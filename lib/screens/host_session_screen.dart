@@ -452,6 +452,80 @@ class _HostSessionScreenState
     }
   }
 
+  Future<void> _exportLogs() async {
+    try {
+      final buffer = StringBuffer()
+        ..writeln('MobiTest Application Logs')
+        ..writeln('Exported at: ${DateTime.now().toIso8601String()}')
+        ..writeln('Device role: host')
+        ..writeln('Broker IP: ${widget.mqttService.brokerIp}')
+        ..writeln('Connected clients: ${widget.mqttService.connectedClientsCount}')
+        ..writeln()
+        ..writeln('========== APPLICATION LOGS ==========');
+
+      final appLogs = List<String>.from(widget.mqttService.messages);
+      if (appLogs.isEmpty) {
+        buffer.writeln('(No application log entries were captured.)');
+      } else {
+        for (final entry in appLogs) {
+          buffer.writeln(entry);
+        }
+      }
+
+      // Include scheduler/assignment logs maintained by the host HTTP server.
+      // If this endpoint is unavailable, still export the application logs.
+      buffer
+        ..writeln()
+        ..writeln('========== SCHEDULER LOGS ==========');
+      try {
+        final response = await http
+            .get(Uri.parse('${widget.mqttService.serverUrl}/admin/scheduler_logs'))
+            .timeout(const Duration(seconds: 5));
+        if (response.statusCode == 200) {
+          final decoded = jsonDecode(response.body);
+          if (decoded is List) {
+            for (final entry in decoded) {
+              buffer.writeln(
+                entry is Map
+                    ? const JsonEncoder.withIndent('  ').convert(entry)
+                    : entry.toString(),
+              );
+            }
+            if (decoded.isEmpty) buffer.writeln('(No scheduler log entries.)');
+          } else {
+            buffer.writeln('Unexpected scheduler log response format.');
+            buffer.writeln(response.body);
+          }
+        } else {
+          buffer.writeln(
+            'Could not retrieve scheduler logs: HTTP ${response.statusCode}',
+          );
+          buffer.writeln(response.body);
+        }
+      } catch (e) {
+        buffer.writeln('Could not retrieve scheduler logs: $e');
+      }
+
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Export Application Logs',
+        fileName: 'mobitest_logs_${DateTime.now().millisecondsSinceEpoch}.txt',
+        type: FileType.custom,
+        allowedExtensions: ['txt'],
+        bytes: utf8.encode(buffer.toString()),
+      );
+
+      if (!mounted || savedPath == null) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Logs saved to $savedPath')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to export logs: $e')),
+      );
+    }
+  }
+
   Future<void> _downloadMetrics() async {
     try {
       // Ask for the file name first; it is also printed inside the report.
@@ -2603,6 +2677,18 @@ class _HostSessionScreenState
                         ),
                       ),
                     ],
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _exportLogs,
+                      icon: const Icon(Icons.description_outlined),
+                      label: const Text('Export Logs'),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 24),
                 ],

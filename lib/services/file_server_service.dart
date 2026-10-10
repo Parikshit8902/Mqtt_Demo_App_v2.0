@@ -346,10 +346,6 @@ class FileServerService {
   Future<FileShareInfo?> shareFile(
     File file,
   ) async {
-    // Clear previous shared files so only the latest
-    // file is available.
-    _sharedFiles.clear();
-
     if (!_isServerRunning) {
       _logger.log(
         '❌ Cannot share file - server not running',
@@ -358,6 +354,22 @@ class FileServerService {
     }
 
     try {
+      final canonicalPath = path.normalize(file.absolute.path);
+      // A dataset is announced separately to each target phone. Reuse the same
+      // server-side ID for every announcement of the same file, otherwise each
+      // phone gets a different jobId and earlier URLs disappear from the server.
+      for (final existing in _sharedFiles.values) {
+        if (path.normalize(existing.file.absolute.path) == canonicalPath) {
+          return FileShareInfo(
+            fileId: existing.id,
+            fileName: existing.name,
+            fileSize: existing.size,
+            mimeType: existing.mimeType,
+            url: '$networkServerUrl/files/${existing.id}',
+          );
+        }
+      }
+
       final fileId = const Uuid().v4();
       final fileName = path.basename(file.path);
       final fileSize = await file.length();
@@ -385,10 +397,10 @@ class FileServerService {
       );
 
       final url =
-          '$serverUrl/files/$fileId';
+          '$networkServerUrl/files/$fileId';
 
       _logger.log(
-        '🔗 File available at: $url',
+        '🔗 File available to clients at: $url',
       );
 
       return FileShareInfo(

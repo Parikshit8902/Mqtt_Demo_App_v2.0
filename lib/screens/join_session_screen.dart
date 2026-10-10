@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import '../services/mqtt_service.dart';
 import '../services/network_helper.dart';
@@ -64,6 +66,48 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
           );
         }
       });
+    }
+  }
+
+  Future<void> _exportLogs() async {
+    try {
+      final mqttService = widget.mqttService;
+      final logs = List<String>.from(mqttService.messages);
+      final buffer = StringBuffer()
+        ..writeln('MobiTest Client Application Logs')
+        ..writeln('Exported at: ${DateTime.now().toIso8601String()}')
+        ..writeln('Device role: client')
+        ..writeln('Broker IP: ${mqttService.brokerIp}')
+        ..writeln('MQTT connected: ${mqttService.isConnected}')
+        ..writeln()
+        ..writeln('========== CLIENT MESSAGE LOGS ==========');
+
+      if (logs.isEmpty) {
+        buffer.writeln('(No application log entries were captured.)');
+      } else {
+        for (final entry in logs) {
+          buffer.writeln(entry);
+        }
+      }
+
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Export Client Logs',
+        fileName:
+            'mobitest_client_logs_${DateTime.now().millisecondsSinceEpoch}.txt',
+        type: FileType.custom,
+        allowedExtensions: ['txt'],
+        bytes: utf8.encode(buffer.toString()),
+      );
+
+      if (!mounted || savedPath == null) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Client logs saved to $savedPath')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to export client logs: $e')),
+      );
     }
   }
 
@@ -341,6 +385,14 @@ class _JoinSessionScreenState extends State<JoinSessionScreen> {
                         style: Theme.of(context).textTheme.titleLarge,
                       ),
                       const Spacer(),
+                      IconButton(
+                        onPressed: _exportLogs,
+                        icon: const Icon(Icons.download_outlined, size: 20),
+                        tooltip: 'Export client logs',
+                        style: IconButton.styleFrom(
+                          foregroundColor: Colors.blueGrey.shade700,
+                        ),
+                      ),
                       IconButton(
                         onPressed: widget.mqttService.clearMessages,
                         icon: const Icon(Icons.delete_outline, size: 20),
