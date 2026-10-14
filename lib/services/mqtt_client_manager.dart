@@ -181,13 +181,13 @@ class MqttClientManager {
   }
   
   /// Subscribe to a specific topic
-  Future<void> subscribeToTopic(String topic) async {
+  Future<void> subscribeToTopic(String topic, {MqttQos qos = MqttQos.atMostOnce}) async {
     _logger.log('📡 Attempting to subscribe to topic: $topic');
     try {
       if (_client != null && _isConnected) {
         _logger.log('✅ Client is connected, proceeding with subscription');
-        _logger.log('🎯 Subscribing to topic: $topic with QoS: atMostOnce');
-        _client!.subscribe(topic, MqttQos.atMostOnce);
+        _logger.log('🎯 Subscribing to topic: $topic with QoS: $qos');
+        _client!.subscribe(topic, qos);
         _subscribedTopics.add(topic);
         _isSubscribed = true;
         _logger.log('📬 Subscription request sent');
@@ -229,7 +229,7 @@ class MqttClientManager {
   }
   
   /// Publish message to topic
-  Future<void> publishMessage({String? message, String? topic}) async {
+  Future<bool> publishMessage({String? message, String? topic, MqttQos qos = MqttQos.atMostOnce}) async {
     final msg = message ?? 'Hello, MQTT!';
     final pubTopic = topic ?? _defaultTopic;
     
@@ -254,7 +254,8 @@ class MqttClientManager {
         // _logger.log('📦 Payload created (${builder.payload!.length} bytes)');
         
         // Publish message
-        _client!.publishMessage(pubTopic, MqttQos.atMostOnce, builder.payload!);
+        _logger.log('📤 Publishing to $pubTopic with QoS: $qos');
+        _client!.publishMessage(pubTopic, qos, builder.payload!);
         final sentBytes = builder.payload!.length;
         TrafficCounter.instance.addTx(
           pubTopic == 'clients/metrics' ? TrafficChannel.mqttMetrics : TrafficChannel.mqtt,
@@ -265,14 +266,17 @@ class MqttClientManager {
         // _logger.log('🚀 Message published successfully');
         
         _onStateChanged?.call();
+        return true;
       } else {
         _logger.log('❌ Cannot publish - client not connected');
         _logger.log('🔍 Client exists: ${_client != null}');
         _logger.log('🔍 Is connected: $_isConnected');
+        return false;
       }
     } catch (e) {
       _logger.log('❌ Publish error: $e');
       _onStateChanged?.call();
+      return false;
     }
   }
   
@@ -346,8 +350,11 @@ class MqttClientManager {
   
   /// Process incoming MQTT messages
   Future<void> _processIncomingMessage(String topic, String message) async {
-    // Log reception first
-    // _logger.log('🔍 Processing message from topic: $topic');
+    // Always log distribution notification receipt so a missing message can be
+    // distinguished from a failed download in exported client logs.
+    if (topic == 'dist/mod' || topic == 'dist/data') {
+      _logger.log('📥 MQTT message received on $topic (${message.length} chars)');
+    }
     
     // Notify the generic message callback first (for TopicManager integration)
     if (_onMessageReceived != null) {

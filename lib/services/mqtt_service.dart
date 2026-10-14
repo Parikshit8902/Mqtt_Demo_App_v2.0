@@ -345,15 +345,7 @@ class MqttService extends ChangeNotifier {
         // Reuse existing processing to download files
         final task = await _handleFileShareMessage(topic, message);
 
-        // MQTT delivers targeted notifications to all subscribers. A non-target
-        // device returns null and must not ACK or attempt warmup with stale state.
-        if (task == null || task.status != DownloadStatus.completed ||
-            !await task.destinationFile.exists()) {
-          _logger.log('⏭️ Ignoring share notification not downloaded by this device');
-          return;
-        }
-
-        // ACK only after this device successfully downloaded the requested file.
+        // After downloads complete, publish a minimal ACK with device IP to ack topic
         final currentIp = await NetworkHelper.getDeviceIPAddress() ?? 'unknown';
 
         // Map dist topic to corresponding ack topic
@@ -387,14 +379,10 @@ class MqttService extends ChangeNotifier {
                   'client_id': _clientManager.clientId,
                   'ttproc_ms': res.ttprocMs.round(),
                   'bandwidth_kBps': res.bandwidthKBps,
-                  'model': modelFile.path.split(RegExp(r'[\\/]')).last,
                   'warmup': true,
                 });
                 try {
                   await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
-                  TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
-                  TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
-                  TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
                   _logger.log('✅ Posted warmup results to host: $postUrl');
                   // Start client worker to fetch assignments and run inference on assigned units
                   try {
@@ -470,31 +458,6 @@ class MqttService extends ChangeNotifier {
         _logger.log('🔍 Server URL: $serverUrl');
         
         // Fetch file list from the server
-        final fileId = messageJson['file_id'];
-        final fileName = messageJson['file_name'];
-        final fileSize = messageJson['file_size'];
-        final mimeType = messageJson['mime_type'];
-        final fileUrl = messageJson['file_url'];
-        if (fileId is String && fileName is String && fileSize is num &&
-            mimeType is String && fileUrl is String) {
-          final shareInfo = FileShareInfo(
-            fileId: fileId,
-            fileName: fileName,
-            fileSize: fileSize.toInt(),
-            mimeType: mimeType,
-            url: fileUrl,
-          );
-          _lastSharedInfoByTopic[topic] = shareInfo;
-          _logger.log('🎯 Downloading exact shared file ${shareInfo.fileName} ($fileId)');
-          final task = await _fileDownloadService.downloadFile(shareInfo);
-          if (task != null && task.status == DownloadStatus.completed &&
-              await task.destinationFile.exists()) {
-            _lastDownloadedFileByTopic[topic] = task.destinationFile;
-          }
-          return task;
-        }
-
-        // Backward-compatible fallback for older senders that only publish server_url.
         final fileListUrl = '$serverUrl/files';
         _logger.log('🔍 Fetching file list from: $fileListUrl');
         

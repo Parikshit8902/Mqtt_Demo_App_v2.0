@@ -354,6 +354,8 @@ class FileServerService {
     }
 
     try {
+      // Restore old sharing semantics: expose only the file announced by the current notification.
+      _sharedFiles.clear();
       final canonicalPath = path.normalize(file.absolute.path);
       // A dataset is announced separately to each target phone. Reuse the same
       // server-side ID for every announcement of the same file, otherwise each
