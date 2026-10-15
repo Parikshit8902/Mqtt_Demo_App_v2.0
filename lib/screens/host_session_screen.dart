@@ -654,106 +654,58 @@ class _HostSessionScreenState
     });
 
     _stopJobStatusPolling();
-    // 1) Share model (broadcast)
-    final modelSent =
-        await widget.mqttService.shareFileToTopic(
+    // Prepare the ACK collector before publishing. A client on a fast LAN can
+    // download and ACK a small model before shareFileToTopic returns; registering
+    // the listener afterwards loses that ACK and falsely reports failure.
+    final expected = widget.mqttService.connectedClientsCount;
+    final Set<String> modelAckSet = {};
+    final modelCompleter = Completer<Set<String>>();
+    void modelAckListener(String topic, String message) {
+      final ack = message.trim();
+      if (ack.isNotEmpty) modelAckSet.add(ack);
+      if (modelAckSet.length >= expected && !modelCompleter.isCompleted) {
+        modelCompleter.complete(modelAckSet);
+      }
+    }
+    // Attach the application listener before requesting the subscription.
+    widget.mqttService.addMessageListener('ack/mod', modelAckListener);
+    try {
+      await widget.mqttService.subscribeToTopic('ack/mod');
+    } catch (e) {
+      widget.mqttService.messageLogger.log('⚠️ Could not subscribe to ack/mod: $e');
+    }
+    final modelAckTimer = Timer(const Duration(seconds: 30), () {
+      if (!modelCompleter.isCompleted) modelCompleter.complete(modelAckSet);
+    });
+
+    // 1) Share model (broadcast) only after the ACK listener is active.
+    final modelSent = await widget.mqttService.shareFileToTopic(
       _selectedModelFile!,
       'dist/mod',
     );
-    if (!mounted) return;
+    if (!mounted) {
+      modelAckTimer.cancel();
+      widget.mqttService.removeMessageListener('ack/mod', modelAckListener);
+      return;
+    }
     if (!modelSent) {
+      modelAckTimer.cancel();
+      widget.mqttService.removeMessageListener('ack/mod', modelAckListener);
       setState(() {
         _isProcessingDistribution = false;
-        _distributionStep =
-            DistributionStep.idle;
+        _distributionStep = DistributionStep.idle;
       });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(
-        const SnackBar(
-          content:
-              Text('Failed to share model'),
-        ),
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to share model')),
       );
       return;
     }
-    // keep showing "sharing" until ACKs are collected
-    ScaffoldMessenger.of(context)
-        .showSnackBar(
-      const SnackBar(
-        content:
-            Text(
-              'Model published — waiting for client ACKs',
-            ),
-      ),
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Model published — waiting for client ACKs')),
     );
-    // 2) Collect model ACKs on ack/mod
-    // (30s or until all connected clients ack)
-    final expected =
-        widget.mqttService.connectedClientsCount;
-    final Set<String> modelAckSet = {};
-    final modelCompleter =
-        Completer<Set<String>>();
-    // subscribe and collect existing messages
-    try {
-      await widget.mqttService
-          .subscribeToTopic('ack/mod');
-      await Future.delayed(
-        const Duration(milliseconds: 200),
-      );
-    } catch (_) {}
-    try {
-      final existing =
-          widget.mqttService.topicManager
-              .getMessagesForTopic(
-                'ack/mod',
-              );
-      for (final m in existing) {
-        if (m.content.isNotEmpty) {
-          modelAckSet.add(
-            m.content.trim(),
-          );
-        }
-      }
-    } catch (_) {}
-    void modelAckListener(
-      String topic,
-      String message,
-    ) {
-      if (message.isNotEmpty) {
-        modelAckSet.add(
-          message.trim(),
-        );
-      }
-      if (
-        modelAckSet.length >= expected &&
-        !modelCompleter.isCompleted
-      ) {
-        modelCompleter.complete(
-          modelAckSet,
-        );
-      }
-    }
-    widget.mqttService.addMessageListener(
-      'ack/mod',
-      modelAckListener,
-    );
-    Timer(
-      const Duration(seconds: 30),
-      () {
-        if (!modelCompleter.isCompleted) {
-          modelCompleter.complete(
-            modelAckSet,
-          );
-        }
-      },
-    );
-    final modelResult =
-        await modelCompleter.future;
-    widget.mqttService
-        .removeMessageListener(
-          'ack/mod',
-          modelAckListener,
-        );
+    final modelResult = await modelCompleter.future;
+    modelAckTimer.cancel();
+    widget.mqttService.removeMessageListener('ack/mod', modelAckListener);
     if (!mounted) return;
     if (modelResult.isEmpty) {
       // no clients acknowledged the model

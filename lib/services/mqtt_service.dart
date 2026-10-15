@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:mqtt_client/mqtt_client.dart';
 import 'client_warmup_service.dart';
 import 'assignments_client.dart';
 import 'client_worker_service.dart';
@@ -279,8 +280,8 @@ class MqttService extends ChangeNotifier {
       await _clientManager.subscribeToTopic('clients/metrics');
       
   // Subscribe to distributed ACK topics so host receives client ACKs
-  await _clientManager.subscribeToTopic('ack/mod');
-  await _clientManager.subscribeToTopic('ack/data');
+  await _clientManager.subscribeToTopic('ack/mod', qos: MqttQos.atLeastOnce);
+  await _clientManager.subscribeToTopic('ack/data', qos: MqttQos.atLeastOnce);
       
       _brokerMonitoringClientConnected = true;
     } else {
@@ -319,11 +320,12 @@ class MqttService extends ChangeNotifier {
     });
   _logger.log('🔧 File share message handler registered');
 
-  // Subscribe to distributed distribution topics and register local listeners
-  await _clientManager.subscribeToTopic('dist/mod');
-  await _clientManager.subscribeToTopic('dist/data');
+  // Register handlers before subscribing so a notification cannot arrive in
+  // the small window between the broker's SUBACK and listener registration.
   addMessageListener('dist/mod', _handleDistributedShare);
   addMessageListener('dist/data', _handleDistributedShare);
+  await _clientManager.subscribeToTopic('dist/mod', qos: MqttQos.atLeastOnce);
+  await _clientManager.subscribeToTopic('dist/data', qos: MqttQos.atLeastOnce);
       
       // Start client metrics publishing
       startClientMetricsPublishing();
@@ -345,7 +347,14 @@ class MqttService extends ChangeNotifier {
         // Reuse existing processing to download files
         final task = await _handleFileShareMessage(topic, message);
 
-        // After downloads complete, publish a minimal ACK with device IP to ack topic
+        // Never acknowledge a notification unless the requested file was
+        // successfully downloaded and exists on disk.
+        if (task == null ||
+            task.status != DownloadStatus.completed ||
+            !await task.destinationFile.exists()) {
+          _logger.log('❌ Not ACKing $topic: download did not complete');
+          return;
+        }
         final currentIp = await NetworkHelper.getDeviceIPAddress() ?? 'unknown';
 
         // Map dist topic to corresponding ack topic
@@ -359,7 +368,12 @@ class MqttService extends ChangeNotifier {
         }
 
         // Keep ACK payload minimal as device IP string to save broker bandwidth
-        await _clientManager.publishMessage(message: currentIp, topic: ackTopic);
+        final ackSent = await _clientManager.publishMessage(
+          message: currentIp, topic: ackTopic, qos: MqttQos.atLeastOnce);
+        if (!ackSent) {
+          _logger.log('❌ ACK publish failed for $ackTopic');
+          return;
+        }
         _logger.log('📣 Published ACK to $ackTopic : $currentIp');
 
         // After ack, if this was a dataset share (dist/data), attempt warmup
@@ -457,7 +471,36 @@ class MqttService extends ChangeNotifier {
   final serverUrl = messageJson['server_url'] as String;
         _logger.log('🔍 Server URL: $serverUrl');
         
-        // Fetch file list from the server
+        // Prefer the exact file advertised in the notification. Listing /files
+        // is racy: a subsequent share can replace the server's current listing,
+        // causing this client to download the wrong file (or no file).
+        final fileId = messageJson['file_id'];
+        final fileName = messageJson['file_name'];
+        final fileSize = messageJson['file_size'];
+        final mimeType = messageJson['mime_type'];
+        final fileUrl = messageJson['file_url'];
+        if (fileId is String && fileId.isNotEmpty &&
+            fileName is String && fileName.isNotEmpty &&
+            fileSize is num && mimeType is String &&
+            fileUrl is String && fileUrl.isNotEmpty) {
+          final shareInfo = FileShareInfo(
+            fileId: fileId,
+            fileName: fileName,
+            fileSize: fileSize.toInt(),
+            mimeType: mimeType,
+            url: fileUrl,
+          );
+          _lastSharedInfoByTopic[topic] = shareInfo;
+          _logger.log('📦 Downloading announced file ${shareInfo.fileName} ($fileId)');
+          final task = await _fileDownloadService.downloadFile(shareInfo);
+          if (task != null && task.status == DownloadStatus.completed &&
+              await task.destinationFile.exists()) {
+            _lastDownloadedFileByTopic[topic] = task.destinationFile;
+          }
+          return task;
+        }
+
+        // Backward-compatible path for older notifications without file metadata.
         final fileListUrl = '$serverUrl/files';
         _logger.log('🔍 Fetching file list from: $fileListUrl');
         
@@ -535,12 +578,19 @@ class MqttService extends ChangeNotifier {
     // Subscribe to clients/metrics (important for analytics dashboard)
     await _clientManager.subscribeToTopic('clients/metrics');
   // Subscribe to distributed ACK topics (host wants to receive ACKs)
-  await _clientManager.subscribeToTopic('ack/mod');
-  await _clientManager.subscribeToTopic('ack/data');
+  await _clientManager.subscribeToTopic('ack/mod', qos: MqttQos.atLeastOnce);
+  await _clientManager.subscribeToTopic('ack/data', qos: MqttQos.atLeastOnce);
   }
   
-  Future<void> subscribeToTopic(String topic) async {
-    await _clientManager.subscribeToTopic(topic);
+  Future<void> subscribeToTopic(String topic, {MqttQos? qos}) async {
+    // Distribution and ACK traffic uses QoS 1 so broker delivery is retried
+    // when a connection is interrupted. Preserve QoS 0 for ordinary chat topics.
+    final effectiveQos = qos ??
+        ((topic == 'dist/mod' || topic == 'dist/data' ||
+          topic == 'ack/mod' || topic == 'ack/data')
+            ? MqttQos.atLeastOnce
+            : MqttQos.atMostOnce);
+    await _clientManager.subscribeToTopic(topic, qos: effectiveQos);
   }
   
   Future<void> unsubscribe() async {
@@ -556,7 +606,7 @@ class MqttService extends ChangeNotifier {
     await _clientManager.unsubscribeFromTopic(topic);
   }
   
-  Future<void> publishMessage({String? message, String? topic}) async {
+  Future<void> publishMessage({String? message, String? topic, MqttQos qos = MqttQos.atMostOnce}) async {
     final usedTopic = topic ?? _clientManager.defaultTopic;
     final usedMessage = message ?? 'Hello, MQTT!';
 
@@ -565,7 +615,11 @@ class MqttService extends ChangeNotifier {
     }
 
     // Send the original message as-is to avoid payload size issues.
-    await _clientManager.publishMessage(message: usedMessage, topic: usedTopic);
+    final sent = await _clientManager.publishMessage(
+      message: usedMessage, topic: usedTopic, qos: qos);
+    if (!sent) {
+      throw StateError('MQTT publish failed for $usedTopic');
+    }
     
     // Don't add to TopicManager here - wait for the message to come back from broker
     // This ensures consistent behavior across all devices and prevents duplicates
@@ -670,7 +724,7 @@ class MqttService extends ChangeNotifier {
         await Future.delayed(const Duration(milliseconds: 200));
 
         try {
-          await publishMessage(message: notificationJson, topic: distTopic);
+          await publishMessage(message: notificationJson, topic: distTopic, qos: MqttQos.atLeastOnce);
           _logger.log('📤 File share notification published to $distTopic (target=$targetIds)');
           try {
             // Also add a local TopicManager entry so host UI shows the outgoing notification immediately
@@ -691,7 +745,7 @@ class MqttService extends ChangeNotifier {
           try {
             if (_clientManager.isConnected) {
               _logger.log('🔁 Attempting direct publish via MqttClientManager to $distTopic');
-              await _clientManager.publishMessage(message: notificationJson, topic: distTopic);
+              await _clientManager.publishMessage(message: notificationJson, topic: distTopic, qos: MqttQos.atLeastOnce);
               _logger.log('✅ Direct publish via client manager succeeded for $distTopic');
             } else {
               _logger.log('❌ Cannot direct-publish: client manager not connected');
