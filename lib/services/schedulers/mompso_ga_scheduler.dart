@@ -2,6 +2,7 @@ import 'dart:math';
 
 import '../models/assignment.dart';
 import 'dynamic_scheduler.dart';
+import 'batch_objective_evaluator.dart';
 import 'pareto_archive.dart';
 import 'scheduling_model.dart';
 
@@ -72,17 +73,13 @@ class MOMPSOGAScheduler extends DynamicScheduler {
     if (remaining.isEmpty || open.isEmpty) return const <UnitPick>[];
 
     final clientIds = List<String>.of(open)..sort();
+    // Use exactly the shared scheduler's hard capacity limits. Queue depth is
+    // already represented in the completion-time objective; turning it into a
+    // second, private capacity rule can produce a partial plan and cause the
+    // base scheduler to fall back to another algorithm.
     final capacities = <int>[
       for (final client in clientIds)
-        () {
-          final view = fleet.views[client]!;
-          final baseCap = max(0, fleet.capFor(client) - view.assigned);
-
-          // Reduce this round's assignment capacity for clients that
-          // already have substantial queued work.
-          final queueFactor = 1.0 / (1.0 + 0.25 * view.pending);
-          return min(baseCap, max(0, (baseCap * queueFactor).floor()));
-        }(),
+        max(0, fleet.capFor(client) - fleet.views[client]!.assigned),
     ];
     final capacity = capacities.fold<int>(0, (sum, value) => sum + value);
     final taskCount = min(remaining.length, capacity);
@@ -264,15 +261,18 @@ class MOMPSOGAScheduler extends DynamicScheduler {
   }
 
   bool _prefer(ParetoObjectives candidate, ParetoObjectives current, List<int> a, List<int> b) {
+    // Never add raw milliseconds to raw joules: that comparison is
+    // dimensionally invalid and changes if either unit is rescaled. Personal
+    // bests / GA replacements advance on Pareto improvement. For identical
+    // objective values, use a deterministic assignment tie-break. Incomparable
+    // trade-offs remain in the Pareto archive instead of being collapsed by an
+    // arbitrary scalar score.
     if (ParetoArchive.dominates(candidate, current)) return true;
     if (ParetoArchive.dominates(current, candidate)) return false;
-    final candidateScore = candidate.completionTime + candidate.energy;
-    final currentScore = current.completionTime + current.energy;
-    if (candidateScore != currentScore) return candidateScore < currentScore;
-    for (var i = 0; i < min(a.length, b.length); i++) {
-      if (a[i] != b[i]) return a[i] < b[i];
-    }
-    return false;
+    final sameObjectives = candidate.completionTime == current.completionTime &&
+        candidate.energy == current.energy;
+    if (!sameObjectives) return false;
+    return _lexicographicallySmaller(a, b);
   }
 
   ParetoSolution _selectFinal(List<ParetoSolution> solutions) {
@@ -330,18 +330,12 @@ class _HybridProblem {
 
   ParetoObjectives evaluate(List<int> assignment) {
     onEvaluate();
-    final loads = <String, double>{for (final id in clientIds) id: fleet.waitMs(id)};
-    final initialWait = <String, double>{for (final id in clientIds) id: fleet.waitMs(id)};
-    var energy = 0.0;
-    for (var task = 0; task < units.length; task++) {
-      final id = clientIds[assignment[task]];
-      final service = max(0.0, fleet.etaMs(id, units[task]) - initialWait[id]!);
-      loads[id] = loads[id]! + service;
-      energy += fleet.energyJ(id);
-    }
-    return ParetoObjectives(
-      completionTime: loads.values.isEmpty ? 0 : loads.values.reduce(max),
-      energy: energy,
+    return BatchObjectiveEvaluator.evaluate(
+      fleet: fleet,
+      units: units,
+      clientIds: clientIds,
+      capacities: capacities,
+      assignment: assignment,
     );
   }
 }

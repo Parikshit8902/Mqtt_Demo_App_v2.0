@@ -150,10 +150,12 @@ class ParetoArchive {
       final maximum = value(_solutions[indices.last]);
       final range = maximum - minimum;
 
+      // A constant objective contributes no crowding information. In that
+      // case it must not mark arbitrary sorted endpoints as boundary points.
+      if (range == 0) return;
+
       distances[indices.first] = double.infinity;
       distances[indices.last] = double.infinity;
-
-      if (range == 0) return;
 
       for (var i = 1; i < indices.length - 1; i++) {
         final index = indices[i];

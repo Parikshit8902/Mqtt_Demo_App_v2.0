@@ -1,4 +1,3 @@
-
 import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -57,6 +56,7 @@ void main() {
       final b = ParetoObjectives(completionTime: 100, energy: 20);
 
       expect(ParetoArchive.dominates(a, b), isTrue);
+      expect(ParetoArchive.dominates(b, a), isFalse);
     });
   });
 
@@ -113,14 +113,16 @@ void main() {
         isTrue,
       );
 
-      // Same assignment is rejected even if re-evaluated with different
-      // objective values.
+      // The archive rejects a duplicate assignment even if its objective
+      // values differ from the values stored for the original assignment.
       expect(
         archive.add(solution([0, 1], time: 90, energy: 15)),
         isFalse,
       );
 
       expect(archive.length, 1);
+      expect(archive.solutions.single.objectives.completionTime, 100);
+      expect(archive.solutions.single.objectives.energy, 20);
     });
 
     test('crowding distances preserve boundary solutions', () {
@@ -133,9 +135,22 @@ void main() {
 
       final distances = archive.crowdingDistances();
 
-      expect(distances.length, 4);
-      expect(distances.any((d) => d == double.infinity), isTrue);
-      expect(distances.every((d) => d >= 0), isTrue);
+      expect(distances, hasLength(4));
+      expect(distances.any((distance) => distance == double.infinity), isTrue);
+      expect(distances.every((distance) => distance >= 0), isTrue);
+    });
+
+    test('constant objective does not create arbitrary infinite boundaries', () {
+      final archive = ParetoArchive(capacity: 10)
+        ..add(solution([0], time: 100, energy: 2))
+        ..add(solution([1], time: 100, energy: 2))
+        ..add(solution([2], time: 100, energy: 2))
+        ..add(solution([3], time: 100, energy: 2));
+
+      final distances = archive.crowdingDistances();
+
+      expect(distances, hasLength(4));
+      expect(distances.every((distance) => distance == 0.0), isTrue);
     });
 
     test('archive remains bounded', () {
@@ -157,13 +172,10 @@ void main() {
 
     test('seeded leader selection is reproducible', () {
       ParetoArchive createArchive() {
-        final archive = ParetoArchive();
-
-        archive.add(solution([0], time: 100, energy: 30));
-        archive.add(solution([1], time: 120, energy: 20));
-        archive.add(solution([2], time: 140, energy: 10));
-
-        return archive;
+        return ParetoArchive()
+          ..add(solution([0], time: 100, energy: 30))
+          ..add(solution([1], time: 120, energy: 20))
+          ..add(solution([2], time: 140, energy: 10));
       }
 
       List<List<int>> run(int seed) {

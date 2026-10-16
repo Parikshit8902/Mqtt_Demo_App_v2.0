@@ -71,7 +71,14 @@ abstract class DynamicScheduler implements Scheduler {
     final initialOpen = fleet.eligibleIds
         .where((c) => assignments[c]!.length < fleet.capFor(c))
         .toList();
-    final batchPlan = planBatch(fleet, List<Unit>.unmodifiable(remaining), List<String>.unmodifiable(initialOpen));
+    final batchPlan = planBatch(
+      fleet,
+      List<Unit>.unmodifiable(remaining),
+      List<String>.unmodifiable(initialOpen),
+    );
+    if (batchPlan != null) {
+      _validateBatchPlan(batchPlan, remaining, initialOpen, fleet);
+    }
     var batchPlanIndex = 0;
 
     while (remaining.isNotEmpty) {
@@ -82,22 +89,30 @@ abstract class DynamicScheduler implements Scheduler {
       final String winner;
       UnitPick? pair;
       if (batchPlan != null) {
-        while (batchPlanIndex < batchPlan.length) {
-          final candidate = batchPlan[batchPlanIndex++];
-          if (remaining.contains(candidate.unit) && open.contains(candidate.client)) {
-            pair = candidate;
-            break;
-          }
+        // A non-null batch plan is an explicit optimizer decision. Never
+        // silently switch to a different algorithm when that plan is spent.
+        if (batchPlanIndex >= batchPlan.length) {
+          throw StateError(
+            '$id returned an incomplete batch plan: '
+            '${batchPlan.length} picks for ${min(remaining.length, open.fold<int>(0, (sum, client) => sum + fleet.capFor(client) - assignments[client]!.length))} remaining schedulable slots.',
+          );
         }
-      }
-      pair ??= pickPair(fleet, remaining, open);
-      if (pair != null && remaining.contains(pair.unit) && open.contains(pair.client)) {
+        pair = batchPlan[batchPlanIndex++];
         unit = pair.unit;
         winner = pair.client;
-        remaining.remove(unit);
+        if (!remaining.remove(unit)) {
+          throw StateError('$id batch plan reused a unit that is no longer available.');
+        }
       } else {
-        unit = remaining.removeAt(0);
-        winner = open.length == 1 ? open.first : pick(fleet, open, unit);
+        pair = pickPair(fleet, remaining, open);
+        if (pair != null && remaining.contains(pair.unit) && open.contains(pair.client)) {
+          unit = pair.unit;
+          winner = pair.client;
+          remaining.remove(unit);
+        } else {
+          unit = remaining.removeAt(0);
+          winner = open.length == 1 ? open.first : pick(fleet, open, unit);
+        }
       }
 
       assignments[winner]!.add(unit);
@@ -106,6 +121,51 @@ abstract class DynamicScheduler implements Scheduler {
 
     lastTrace = {'scheduler': id, 'clients': fleet.explain()};
     return assignments;
+  }
+
+  /// Validate a whole-batch plan before committing any of it. A planner must
+  /// cover every slot that can be filled under the shared scheduler's caps;
+  /// otherwise the base class would silently mix algorithms or leave work
+  /// unassigned. The plan may omit units only when aggregate capacity is lower
+  /// than the number of available units.
+  void _validateBatchPlan(
+    List<UnitPick> plan,
+    List<Unit> available,
+    List<String> open,
+    FleetModel fleet,
+  ) {
+    final capacityByClient = <String, int>{
+      for (final client in open) client: fleet.capFor(client),
+    };
+    final totalCapacity = capacityByClient.values.fold<int>(0, (a, b) => a + b);
+    final expectedLength = min(available.length, totalCapacity);
+    if (plan.length != expectedLength) {
+      throw StateError(
+        '$id returned ${plan.length} picks; expected $expectedLength '
+        'to fill all schedulable slots.',
+      );
+    }
+
+    final availableSet = available.toSet();
+    final plannedUnits = <Unit>{};
+    final counts = <String, int>{};
+    for (final pick in plan) {
+      if (!availableSet.contains(pick.unit)) {
+        throw StateError('$id batch plan contains a unit outside the available batch.');
+      }
+      if (!plannedUnits.add(pick.unit)) {
+        throw StateError('$id batch plan assigns the same unit more than once.');
+      }
+      final cap = capacityByClient[pick.client];
+      if (cap == null) {
+        throw StateError('$id batch plan assigns work to an ineligible client: ${pick.client}.');
+      }
+      final count = (counts[pick.client] ?? 0) + 1;
+      if (count > cap) {
+        throw StateError('$id batch plan exceeds ${pick.client} capacity ($cap).');
+      }
+      counts[pick.client] = count;
+    }
   }
 
   /// Best-scoring id, ties broken by id so results don't depend on map order.

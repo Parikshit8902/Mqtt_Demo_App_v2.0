@@ -37,7 +37,7 @@ class SchedulingConfig {
   /// CPU utilisation assumed while inferring, when no better figure is known.
   final double nominalUtilization;
 
-  /// Weight of measured recent latency vs the modelled service time (0..1).
+  /// Weight of recent per-unit service duration used to calibrate modeled service time (0..1).
   final double measuredLatencyBlend;
 
   const SchedulingConfig({
@@ -189,15 +189,27 @@ class _PowerRow {
 class EnergyEstimator {
   EnergyEstimator._();
 
-  // Wi-Fi radio: a new high-power cycle costs ramp + transfer + tail; while the
-  // radio is still in its tail window only the transfer is charged.
+  // Task-level Wi-Fi energy estimates, in joules. Transfer energy is charged
+  // per task. The caller supplies whether a radio session is already active;
+  // ramp/tail overhead is charged only when it is not. The estimator itself
+  // does not decide whether tasks in a candidate batch share a radio session.
+  // These constants are estimates, not measurements from the target devices.
   static const double wifiRampJ = 0.005;
   static const double wifiXferJ = 0.002;
   static const double wifiTailJ = 0.015;
 
-  /// Marginal energy (joules) for one unit: compute over the inference window
-  /// plus the radio cost of one download and one result upload.
-  /// [radioWarm] is true when the phone already has work queued (radio busy).
+  /// Estimates the marginal energy (joules) for one task.
+  ///
+  /// Compute energy is estimated as average power during [procMs]. Network
+  /// energy includes one download and one result upload. When [radioWarm] is
+  /// false, this task also pays the radio ramp and tail overhead. When true,
+  /// those overheads are omitted for this task only.
+  ///
+  /// This is deliberately a per-task estimate, not a batch-energy function.
+  /// The caller must decide whether each task starts a new radio session or
+  /// reuses an active one, and pass [radioWarm] accordingly. Batch-level
+  /// sharing of startup/tail costs is therefore a caller policy, not something
+  /// inferred by this method.
   static double unitEnergyJ({
     required DevicePower power,
     required double procMs,
@@ -205,9 +217,11 @@ class EnergyEstimator {
     required bool radioWarm,
   }) {
     final u = cpuUtil.clamp(0.0, 1.0);
-    final compute = (power.idleW + (power.maxW - power.idleW) * u) * (procMs / 1000.0);
-    final network = 2 * wifiXferJ + (radioWarm ? 0.0 : wifiRampJ + wifiTailJ);
-    return compute + network;
+    final compute =
+        (power.idleW + (power.maxW - power.idleW) * u) * (procMs / 1000.0);
+    final transfer = 2 * wifiXferJ;
+    final sessionOverhead = radioWarm ? 0.0 : wifiRampJ + wifiTailJ;
+    return compute + transfer + sessionOverhead;
   }
 }
 
@@ -336,24 +350,43 @@ class FleetModel {
 
   double _modelServiceMs(ClientView v, double bytes) => _txMs(v, bytes) + v.procMs;
 
-  /// Service time for an average unit: the model, blended with what the phone
-  /// actually achieved recently when that is known.
+  /// Effective service time for a unit of [bytes] on [v].
+  ///
+  /// `recentLatencyMs` is recorded by the worker around one unit's download
+  /// and inference. It is a service-duration measurement, not queue-wait time.
+  /// Since the measured unit may differ in size from the unit being estimated,
+  /// use it to calibrate the model's average-unit duration multiplicatively.
+  /// This preserves the model's relative size sensitivity instead of blending
+  /// the same raw latency into every task regardless of size.
+  double _effectiveServiceMs(ClientView v, double bytes) {
+    final modelForBytes = _modelServiceMs(v, bytes);
+    final measured = v.est.recentLatencyMs;
+    final weight = cfg.measuredLatencyBlend.clamp(0.0, 1.0);
+
+    if (measured <= 0 || weight == 0) return modelForBytes;
+
+    final modelForAverage = _modelServiceMs(v, avgUnitBytes);
+    if (modelForAverage <= 0) return modelForBytes;
+
+    final calibration = measured / modelForAverage;
+    final scale = (1 - weight) + weight * calibration;
+    return modelForBytes * scale;
+  }
+
+  /// Effective service time for an average-sized unit.
   double perUnitServiceMs(String id) {
     final v = views[id]!;
-    final model = _modelServiceMs(v, avgUnitBytes);
-    final measured = v.est.recentLatencyMs;
-    if (measured <= 0) return model;
-    final w = cfg.measuredLatencyBlend.clamp(0.0, 1.0);
-    return w * measured + (1 - w) * model;
+    return _effectiveServiceMs(v, avgUnitBytes);
   }
 
   /// Time to drain what is already queued on this phone.
   double waitMs(String id) => views[id]!.pending * perUnitServiceMs(id);
 
   /// Estimated finish time of [unit] if given to [id] now.
+  /// Both queued work and this task use the same calibrated service model.
   double etaMs(String id, Unit unit) {
     final v = views[id]!;
-    return waitMs(id) + _modelServiceMs(v, unitBytes(unit).toDouble());
+    return waitMs(id) + _effectiveServiceMs(v, unitBytes(unit).toDouble());
   }
 
   /// Expected latency of the next unit on this phone (queue wait + service).
@@ -389,7 +422,13 @@ class FleetModel {
     return batSc + rest * (0.28 * cpuFree + 0.32 * throughput + 0.22 * procRate + 0.18 * queue);
   }
 
-  /// Marginal energy (J) of giving this phone one more unit.
+  /// Estimated marginal energy (J) for one additional task on this phone.
+  ///
+  /// Existing pending work is used as a proxy for an already-active radio
+  /// session. This does not claim that queued work guarantees the Wi-Fi radio
+  /// is physically active; it is the current model's explicit approximation.
+  /// The returned value is per task. Batch evaluators must explicitly decide
+  /// whether later candidate tasks reuse a radio session.
   double energyJ(String id) {
     final v = views[id]!;
     return EnergyEstimator.unitEnergyJ(

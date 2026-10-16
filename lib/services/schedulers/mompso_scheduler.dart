@@ -1,7 +1,9 @@
 import 'dart:math';
+import 'personal_best_archive.dart';
 import 'pareto_archive.dart';
 import '../models/assignment.dart';
 import 'dynamic_scheduler.dart';
+import 'batch_objective_evaluator.dart';
 import 'scheduling_model.dart';
 
 /// Multi-objective Particle Swarm Optimization scheduler.
@@ -221,6 +223,14 @@ class MOMPSOScheduler extends DynamicScheduler {
           velocity: velocity,
           personalBestPosition: List<int>.of(position),
           personalBestObjectives: objectives,
+          personalBestArchive: PersonalBestArchive(
+            capacity: min(5, archiveSize),
+          )..add(
+              ParetoSolution(
+                assignments: List<int>.of(position),
+                objectives: objectives,
+              ),
+            ),
         ),
       );
     }
@@ -277,29 +287,24 @@ class MOMPSOScheduler extends DynamicScheduler {
 
         particle.position = nextPosition;
 
-        if (ParetoArchive.dominates(
-          nextObjectives,
-          particle.personalBestObjectives,
-        )) {
-          particle.personalBestPosition = List<int>.of(nextPosition);
-          particle.personalBestObjectives = nextObjectives;
-        } else if (!ParetoArchive.dominates(
-              particle.personalBestObjectives,
-              nextObjectives,
-            ) &&
-            _sameObjectiveValues(
-              nextObjectives,
-              particle.personalBestObjectives,
-            )) {
-          // Deterministic tie-breaking.
-          if (_lexicographicallySmaller(
-            nextPosition,
-            particle.personalBestPosition,
-          )) {
-            particle.personalBestPosition = List<int>.of(nextPosition);
-            particle.personalBestObjectives = nextObjectives;
-          }
-        }
+        // Keep a bounded non-dominated set of personal-best experiences.
+        // This preserves incomparable trade-offs (e.g. faster but more
+        // energy-intensive candidates) instead of silently discarding them.
+        particle.personalBestArchive.add(
+          ParetoSolution(
+            assignments: List<int>.of(nextPosition),
+            objectives: nextObjectives,
+          ),
+        );
+
+        // Choose a diverse member of the personal-best set as the cognitive
+        // target for the next iteration. The archive uses the same objective
+        // dominance and crowding-distance policy as the global archive.
+        final personalBest =
+            particle.personalBestArchive.selectLeader(random);
+        particle.personalBestPosition =
+            List<int>.of(personalBest.assignments);
+        particle.personalBestObjectives = personalBest.objectives;
 
         archive.add(
           ParetoSolution(
@@ -495,13 +500,6 @@ class MOMPSOScheduler extends DynamicScheduler {
     return best!;
   }
 
-  bool _sameObjectiveValues(ParetoObjectives a, ParetoObjectives b) {
-    const epsilon = 1e-12;
-
-    return (a.completionTime - b.completionTime).abs() <= epsilon &&
-        (a.energy - b.energy).abs() <= epsilon;
-  }
-
   bool _lexicographicallySmaller(List<int> a, List<int> b) {
     final length = min(a.length, b.length);
 
@@ -540,47 +538,15 @@ class _MOMPSOProblem {
     required this.capacities,
   });
 
-  /// Evaluates a complete assignment vector.
-  ///
-  /// Objective 1:
-  ///
-  ///   T(X) = max_i { W_i + sum_j assigned_to_i S_ij }
-  ///
-  /// where S_ij is the current modeled transfer + processing service time.
-  ///
-  /// Objective 2:
-  ///
-  ///   E(X) = sum_j E_ij
-  ///
-  /// using FleetModel's current marginal per-unit energy estimate.
-  ParetoObjectives evaluate(List<int> assignment) {
-    final loads = <String, double>{
-      for (final clientId in clientIds) clientId: fleet.waitMs(clientId),
-    };
-
-    var energy = 0.0;
-
-    for (var task = 0; task < units.length; task++) {
-      final workerIndex = assignment[task];
-      final clientId = clientIds[workerIndex];
-
-      final initialWait = fleet.waitMs(clientId);
-
-      final service = fleet.etaMs(clientId, units[task]) - initialWait;
-
-      loads[clientId] = loads[clientId]! + max(0.0, service);
-
-      energy += fleet.energyJ(clientId);
-    }
-
-    var completionTime = 0.0;
-
-    for (final load in loads.values) {
-      completionTime = max(completionTime, load);
-    }
-
-    return ParetoObjectives(completionTime: completionTime, energy: energy);
-  }
+  /// Evaluates a complete candidate using the shared objective definition.
+  ParetoObjectives evaluate(List<int> assignment) =>
+      BatchObjectiveEvaluator.evaluate(
+        fleet: fleet,
+        units: units,
+        clientIds: clientIds,
+        capacities: capacities,
+        assignment: assignment,
+      );
 }
 
 /// A single MOMPSO particle.
@@ -593,10 +559,13 @@ class _MOMPSOParticle {
 
   ParetoObjectives personalBestObjectives;
 
+  final PersonalBestArchive personalBestArchive;
+
   _MOMPSOParticle({
     required this.position,
     required this.velocity,
     required this.personalBestPosition,
     required this.personalBestObjectives,
+    required this.personalBestArchive,
   });
 }
