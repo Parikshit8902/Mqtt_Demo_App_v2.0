@@ -33,8 +33,16 @@ class ClientWorkerService extends ChangeNotifier {
     notifyListeners();
     MetricsStore.instance.setLocalIdentity(deviceKeyFromClientId(clientId), deviceNameFromClientId(clientId));
     _logger.log('🚧 Client worker started for job $jobId');
-    // Ensure model is loaded
-    await _inferenceService.loadModel();
+    // Ensure model is loaded. A load failure must not leave a phantom worker
+    // marked as running or escape as an unhandled asynchronous exception.
+    try {
+      await _inferenceService.loadModel();
+    } catch (e) {
+      _logger.log('❌ Worker could not load model: $e');
+      _running = false;
+      notifyListeners();
+      return;
+    }
 
     while (_running) {
       try {

@@ -101,8 +101,10 @@ class MqttService extends ChangeNotifier {
   String get brokerIp => _clientManager.brokerIp;
   List<String> get messages => _logger.messages;
   AppMode get currentMode => _currentMode;
-  List<ConnectedClient> get connectedClients => _clientTracker.connectedClients;
-  int get connectedClientsCount => _clientTracker.connectedCount;
+  List<ConnectedClient> get connectedClients => _clientTracker.connectedClients
+      .where((client) => client.clientId != _clientManager.clientId)
+      .toList();
+  int get connectedClientsCount => connectedClients.length;
   bool get canPublishFromHost => isBrokerRunning && (_brokerMonitoringClientConnected || isConnected);
   String get defaultTopic => _clientManager.defaultTopic;
   String get shareTopic => _clientManager.shareTopic;
@@ -166,19 +168,18 @@ class MqttService extends ChangeNotifier {
       final warmup = await ClientWarmupService(_logger)
           .runWarmupWithModel(datasetUrl, modelFile.path, samples: 3);
       if (warmup == null) {
-        _logger.log('⚠️ Host warmup failed; host worker was not started');
-        return false;
+        _logger.log('⚠️ Host warmup measurement failed; using conservative scheduling estimates');
       }
 
       final hostClientId = _clientManager.clientId;
       final report = jsonEncode({
         'client_id': hostClientId,
-        'ttproc_ms': warmup.ttprocMs.round(),
-        'bandwidth_kBps': warmup.bandwidthKBps,
+        'ttproc_ms': warmup?.ttprocMs.round() ?? 1000,
+        'bandwidth_kBps': warmup?.bandwidthKBps ?? 1.0,
         'model': modelFile.uri.pathSegments.isEmpty
             ? modelFile.path
             : modelFile.uri.pathSegments.last,
-        'warmup': true,
+        'warmup': warmup != null,
       });
       final response = await http.post(
         Uri.parse('$base/admin/warmup'),
@@ -216,6 +217,19 @@ class MqttService extends ChangeNotifier {
     _clientWorkerService = null;
     _hostWorkerJobId = null;
     _logger.log('🛑 Host worker stopped');
+  }
+
+  /// Stop any worker from the previous experiment and discard stale file
+  /// associations. Called on reset and when a new model distribution arrives.
+  void resetExperimentRuntimeState() {
+    _clientWorkerService?.stop();
+    _clientWorkerService = null;
+    _hostWorkerJobId = null;
+    _lastSharedInfoByTopic.clear();
+    _lastDownloadedFileByTopic.clear();
+    _topicManager.clearTopicMessages('ack/mod');
+    _topicManager.clearTopicMessages('ack/data');
+    _logger.log('🧹 Cleared prior experiment worker and sharing state');
   }
 
   // Client metrics publishing management
@@ -344,6 +358,16 @@ class MqttService extends ChangeNotifier {
           messageJson.containsKey('type') &&
           messageJson['type'] == 'file_notification') {
 
+        if (topic == 'dist/mod') {
+          // A new model marks the start of a new run. Do not leave an old worker
+          // polling an inactive job or let old dataset metadata trigger warmup.
+          _clientWorkerService?.stop();
+          _clientWorkerService = null;
+          _hostWorkerJobId = null;
+          _lastSharedInfoByTopic.clear();
+          _lastDownloadedFileByTopic.clear();
+        }
+
         // Reuse existing processing to download files
         final task = await _handleFileShareMessage(topic, message);
 
@@ -367,14 +391,21 @@ class MqttService extends ChangeNotifier {
           ackTopic = 'ack/data';
         }
 
-        // Keep ACK payload minimal as device IP string to save broker bandwidth
+        // Include the unique client ID as well as IP. IP-only ACKs collapse two
+        // devices into one participant if Android IP discovery returns the same
+        // address on both devices. The host accepts legacy raw-IP ACKs too.
+        final ackPayload = jsonEncode({
+          'client_id': _clientManager.clientId,
+          'ip': currentIp,
+          'file_id': _lastSharedInfoByTopic[topic]?.fileId,
+        });
         final ackSent = await _clientManager.publishMessage(
-          message: currentIp, topic: ackTopic, qos: MqttQos.atLeastOnce);
+          message: ackPayload, topic: ackTopic, qos: MqttQos.atLeastOnce);
         if (!ackSent) {
           _logger.log('❌ ACK publish failed for $ackTopic');
           return;
         }
-        _logger.log('📣 Published ACK to $ackTopic : $currentIp');
+        _logger.log('📣 Published ACK to $ackTopic for ${_clientManager.clientId} ($currentIp)');
 
         // After ack, if this was a dataset share (dist/data), attempt warmup
         if (topic == 'dist/data') {
@@ -387,35 +418,64 @@ class MqttService extends ChangeNotifier {
               final res = await warmupSrv.runWarmupWithModel(shareInfo.url, modelFile.path, samples: 3);
               if (res != null) {
                 _logger.log('📤 Warmup complete — ttproc=${res.ttprocMs.toStringAsFixed(1)} ms, bw=${res.bandwidthKBps.toStringAsFixed(1)} kB/s');
-                // Post warmup results to the host file server admin endpoint
-                final postUrl = '${shareInfo.url.split('/files/').first}/admin/warmup';
-                final body = jsonEncode({
-                  'client_id': _clientManager.clientId,
-                  'ttproc_ms': res.ttprocMs.round(),
-                  'bandwidth_kBps': res.bandwidthKBps,
-                  'warmup': true,
-                });
+              } else {
+                _logger.log('⚠️ Warmup measurement failed; registering worker with fallback estimates');
+              }
+
+              // Registration is required for scheduling. Retry the registration
+              // endpoint independently of warmup success, then start the worker.
+              final serverBase = shareInfo.url.split('/files/').first;
+              final postUrl = '$serverBase/admin/warmup';
+              final body = jsonEncode({
+                'client_id': _clientManager.clientId,
+                'ttproc_ms': res?.ttprocMs.round() ?? 1000,
+                'bandwidth_kBps': res?.bandwidthKBps ?? 1.0,
+                'model': modelFile.path.split(RegExp(r'[\\/]')).last,
+                'warmup': res != null,
+              });
+              var registered = false;
+              for (var attempt = 1; attempt <= 3 && !registered; attempt++) {
                 try {
-                  await http.post(Uri.parse(postUrl), headers: {'Content-Type': 'application/json'}, body: body);
-                  _logger.log('✅ Posted warmup results to host: $postUrl');
-                  // Start client worker to fetch assignments and run inference on assigned units
-                  try {
-                    final serverBase = shareInfo.url.split('/files/').first; // e.g. http://host:8080
-                    final assignClient = AssignmentsClient(_logger, serverBase: serverBase);
-                    final inference = InferenceService(modelPath: modelFile.path);
-                    final jobId = shareInfo.fileId.isNotEmpty ? shareInfo.fileId : 'demo_job';
-                    _clientWorkerService = ClientWorkerService(_logger, assignClient, inference, jobId: jobId, clientId: _clientManager.clientId);
-                    // start worker without awaiting to keep UI responsive
-                    _clientWorkerService!.start();
-                    _logger.log('🚀 Client worker started to process assigned units for job $jobId');
-                  } catch (e) {
-                    _logger.log('⚠️ Failed to start client worker: $e');
+                  final response = await http
+                      .post(Uri.parse(postUrl),
+                          headers: {'Content-Type': 'application/json'}, body: body)
+                      .timeout(const Duration(seconds: 5));
+                  registered = response.statusCode >= 200 && response.statusCode < 300;
+                  if (registered) {
+                    TrafficCounter.instance.addTx(TrafficChannel.httpControl, utf8.encode(body).length);
+                    TrafficCounter.instance.countTxMsg(TrafficChannel.httpControl);
+                    TrafficCounter.instance.countRxMsg(TrafficChannel.httpControl);
+                    _logger.log('✅ Registered client with host: $postUrl');
+                  } else {
+                    _logger.log('⚠️ Client registration attempt $attempt failed: HTTP ${response.statusCode}');
                   }
                 } catch (e) {
-                  _logger.log('⚠️ Failed to post warmup results: $e');
+                  _logger.log('⚠️ Client registration attempt $attempt failed: $e');
                 }
-              } else {
-                _logger.log('⚠️ Warmup returned no result');
+                if (!registered && attempt < 3) {
+                  await Future.delayed(const Duration(milliseconds: 300));
+                }
+              }
+              if (!registered) {
+                _logger.log('❌ Could not register client with scheduler; worker will retry assignment polling');
+              }
+
+              try {
+                _clientWorkerService?.stop();
+                final assignClient = AssignmentsClient(_logger, serverBase: serverBase);
+                final inference = InferenceService(modelPath: modelFile.path);
+                final jobId = shareInfo.fileId.isNotEmpty ? shareInfo.fileId : 'demo_job';
+                _clientWorkerService = ClientWorkerService(
+                  _logger,
+                  assignClient,
+                  inference,
+                  jobId: jobId,
+                  clientId: _clientManager.clientId,
+                );
+                _clientWorkerService!.start();
+                _logger.log('🚀 Client worker started to process assigned units for job $jobId');
+              } catch (e) {
+                _logger.log('⚠️ Failed to start client worker: $e');
               }
             } else {
               _logger.log('⚠️ Skipping warmup — missing shareInfo or model file or download not completed');
@@ -455,7 +515,7 @@ class MqttService extends ChangeNotifier {
             final currentIp = await NetworkHelper.getDeviceIPAddress();
             _logger.log('🔍 Current device IP: $currentIp');
             
-            if (currentIp != targetIds) {
+            if (currentIp != targetIds && _clientManager.clientId != targetIds) {
               _logger.log('⏭️ File not targeted to this device, skipping download');
               return null;
             } else {
@@ -471,36 +531,7 @@ class MqttService extends ChangeNotifier {
   final serverUrl = messageJson['server_url'] as String;
         _logger.log('🔍 Server URL: $serverUrl');
         
-        // Prefer the exact file advertised in the notification. Listing /files
-        // is racy: a subsequent share can replace the server's current listing,
-        // causing this client to download the wrong file (or no file).
-        final fileId = messageJson['file_id'];
-        final fileName = messageJson['file_name'];
-        final fileSize = messageJson['file_size'];
-        final mimeType = messageJson['mime_type'];
-        final fileUrl = messageJson['file_url'];
-        if (fileId is String && fileId.isNotEmpty &&
-            fileName is String && fileName.isNotEmpty &&
-            fileSize is num && mimeType is String &&
-            fileUrl is String && fileUrl.isNotEmpty) {
-          final shareInfo = FileShareInfo(
-            fileId: fileId,
-            fileName: fileName,
-            fileSize: fileSize.toInt(),
-            mimeType: mimeType,
-            url: fileUrl,
-          );
-          _lastSharedInfoByTopic[topic] = shareInfo;
-          _logger.log('📦 Downloading announced file ${shareInfo.fileName} ($fileId)');
-          final task = await _fileDownloadService.downloadFile(shareInfo);
-          if (task != null && task.status == DownloadStatus.completed &&
-              await task.destinationFile.exists()) {
-            _lastDownloadedFileByTopic[topic] = task.destinationFile;
-          }
-          return task;
-        }
-
-        // Backward-compatible path for older notifications without file metadata.
+        // Fetch file list from the server
         final fileListUrl = '$serverUrl/files';
         _logger.log('🔍 Fetching file list from: $fileListUrl');
         
@@ -709,11 +740,6 @@ class MqttService extends ChangeNotifier {
           'type': 'file_notification',
           'server_url': networkServerUrl,
           'target_ids': targetIds,
-          'file_id': shareInfo.fileId,
-          'file_name': shareInfo.fileName,
-          'file_size': shareInfo.fileSize,
-          'mime_type': shareInfo.mimeType,
-          'file_url': '$networkServerUrl/files/${shareInfo.fileId}',
         };
 
   final notificationJson = jsonEncode(notification);

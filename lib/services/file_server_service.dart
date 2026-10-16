@@ -354,22 +354,29 @@ class FileServerService {
     }
 
     try {
-      // Restore old sharing semantics: expose only the file announced by the current notification.
-      _sharedFiles.clear();
+      // Keep the legacy sharing contract: /files exposes only the file for the
+      // current notification. However, a dataset is announced separately to
+      // every client. Reuse its existing ID before clearing the listing, so all
+      // clients receive the SAME job ID and can request work from one job.
       final canonicalPath = path.normalize(file.absolute.path);
-      // A dataset is announced separately to each target phone. Reuse the same
-      // server-side ID for every announcement of the same file, otherwise each
-      // phone gets a different jobId and earlier URLs disappear from the server.
+      _SharedFile? existingForPath;
       for (final existing in _sharedFiles.values) {
         if (path.normalize(existing.file.absolute.path) == canonicalPath) {
-          return FileShareInfo(
-            fileId: existing.id,
-            fileName: existing.name,
-            fileSize: existing.size,
-            mimeType: existing.mimeType,
-            url: '$networkServerUrl/files/${existing.id}',
-          );
+          existingForPath = existing;
+          break;
         }
+      }
+
+      _sharedFiles.clear();
+      if (existingForPath != null) {
+        _sharedFiles[existingForPath.id] = existingForPath;
+        return FileShareInfo(
+          fileId: existingForPath.id,
+          fileName: existingForPath.name,
+          fileSize: existingForPath.size,
+          mimeType: existingForPath.mimeType,
+          url: '$networkServerUrl/files/${existingForPath.id}',
+        );
       }
 
       final fileId = const Uuid().v4();
@@ -780,13 +787,12 @@ class FileServerService {
   /// Id the current job is registered under: the most recently shared dataset
   /// (zip / coco), or 'demo_job' when none has been shared.
   String _currentJobId() {
-    for (final f in _sharedFiles.values.toList().reversed) {
-      if (f.mimeType == 'application/zip' ||
-          f.name.toLowerCase().contains('coco')) {
-        return f.id;
-      }
+    // The legacy sharing protocol keeps exactly one current file in /files.
+    // During warmup this is the dataset, so its ID must match the job ID used
+    // by every client worker, regardless of dataset filename or MIME type.
+    if (_sharedFiles.isNotEmpty) {
+      return _sharedFiles.values.last.id;
     }
-
     return 'demo_job';
   }
 

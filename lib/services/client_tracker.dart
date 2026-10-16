@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'connected_client.dart';
 import 'message_logger.dart';
@@ -48,28 +49,39 @@ class ClientTracker extends ChangeNotifier {
     notifyListeners();
   }
   
-  /// Try to extract device name and IP from client ID
-  /// Expected format: "mqtt_client_DeviceName_BrokerIP_DeviceIP"
+  /// Parse both the current `mobitest_<nameHex>_<brokerIP>_<deviceIP>_<token>`
+  /// format and legacy `mqtt_client_<name>_<brokerIP>_<deviceIP>` IDs.
   ConnectedClient? parseClientInfo(String clientId) {
     try {
-      // Try to parse client ID in format: mqtt_client_DeviceName_BrokerIP_DeviceIP
-      if (clientId.startsWith('mqtt_client_')) {
-        final parts = clientId.split('_');
-        if (parts.length >= 5) {
-          final deviceName = parts[2];
-          // Convert dashes back to dots for device IP address (parts[4])
-          final deviceIp = parts[4].replaceAll('-', '.');
-          
-          return ConnectedClient(
-            clientId: clientId,
-            deviceName: deviceName,
-            ipAddress: deviceIp,
-            connectedAt: DateTime.now(),
-          );
+      final parts = clientId.split('_');
+      if (parts.length >= 5 &&
+          (clientId.startsWith('mobitest_') ||
+              clientId.startsWith('mqtt_client_'))) {
+        final hasToken = clientId.startsWith('mobitest_') && parts.length >= 5;
+        final deviceIpPart = hasToken ? parts[parts.length - 2] : parts.last;
+        final deviceIp = deviceIpPart.replaceAll('-', '.');
+        String deviceName;
+        if (clientId.startsWith('mobitest_')) {
+          final hex = parts[1];
+          final bytes = <int>[];
+          for (var i = 0; i + 1 < hex.length; i += 2) {
+            final byte = int.tryParse(hex.substring(i, i + 2), radix: 16);
+            if (byte == null) throw FormatException('Invalid device-name encoding');
+            bytes.add(byte);
+          }
+          deviceName = utf8.decode(bytes, allowMalformed: true);
+        } else {
+          final nameEnd = parts.length - 2; // strip broker and device IP
+          deviceName = parts.sublist(2, nameEnd).join('_');
         }
+        return ConnectedClient(
+          clientId: clientId,
+          deviceName: deviceName.isEmpty ? clientId : deviceName,
+          ipAddress: deviceIp,
+          connectedAt: DateTime.now(),
+        );
       }
-      
-      // Fallback: create client with just the ID
+
       return ConnectedClient(
         clientId: clientId,
         deviceName: clientId,

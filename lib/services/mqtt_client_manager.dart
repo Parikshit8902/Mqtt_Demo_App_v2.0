@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import 'message_logger.dart';
@@ -18,6 +19,8 @@ class MqttClientManager {
   bool _isSubscribed = false;
   String _brokerIp = '';
   String _clientId = 'flutter_client_${DateTime.now().millisecondsSinceEpoch}';
+  final String _instanceToken =
+      '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(1 << 32).toRadixString(36)}';
   final String _defaultTopic = 'test/topic';
   final String _shareTopic = 'share/topic';
   final Set<String> _subscribedTopics = {};
@@ -55,10 +58,16 @@ class MqttClientManager {
     try {
       _brokerIp = brokerIp;
       
-      // Generate client ID with device name and device IP and broker IP
+      // The device model/name is not a unique identity (several phones may
+      // report the same Android model). Hex-encode it so separators in names
+      // cannot corrupt parsing, and append a per-service token so two clients
+      // cannot evict each other from the broker even if IP discovery collides.
       final deviceName = await DeviceInfoHelper.getDeviceName() ?? 'Unknown';
       final deviceIp = await NetworkHelper.getDeviceIPAddress() ?? 'unknown';
-      _clientId = 'mqtt_client_${deviceName}_${brokerIp.replaceAll('.', '-')}_${deviceIp.replaceAll('.', '-')}';
+      final nameHex = utf8.encode(deviceName)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+      _clientId = 'mobitest_${nameHex}_${brokerIp.replaceAll('.', '-')}_${deviceIp.replaceAll('.', '-')}_$_instanceToken';
       _logger.log('👤 Client ID: $_clientId');
       
       // Disconnect existing client if connected

@@ -418,6 +418,9 @@ class _HostSessionScreenState
     if (!mounted) return;
 
     if (ok) {
+      widget.mqttService.resetExperimentRuntimeState();
+      widget.mqttService.topicManager.clearTopicMessages('ack/mod');
+      widget.mqttService.topicManager.clearTopicMessages('ack/data');
       setState(() {
         _jobProgress = {};
         _perClientQueues = {};
@@ -587,6 +590,23 @@ class _HostSessionScreenState
     }
   }
 
+  /// Return the unique targeting key from current JSON ACKs, or the legacy IP.
+  String _ackTargetKey(String raw) {
+    final value = raw.trim();
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is Map<String, dynamic>) {
+        final clientId = decoded['client_id'];
+        if (clientId is String && clientId.isNotEmpty) return clientId;
+        final ip = decoded['ip'];
+        if (ip is String && ip.isNotEmpty) return ip;
+      }
+    } catch (_) {
+      // Backward compatibility: old clients send the IP as plain text.
+    }
+    return value;
+  }
+
   Future<void> _submitDistribution() async {
     if (
       widget.mqttService
@@ -637,6 +657,8 @@ class _HostSessionScreenState
       return;
     }
 
+    widget.mqttService.resetExperimentRuntimeState();
+
     setState(() {
       _isProcessingDistribution = true;
       _distributionStep =
@@ -661,9 +683,10 @@ class _HostSessionScreenState
     final Set<String> modelAckSet = {};
     final modelCompleter = Completer<Set<String>>();
     void modelAckListener(String topic, String message) {
-      final ack = message.trim();
+      final ack = _ackTargetKey(message);
       if (ack.isNotEmpty) modelAckSet.add(ack);
-      if (modelAckSet.length >= expected && !modelCompleter.isCompleted) {
+      if (expected > 0 && modelAckSet.length >= expected &&
+          !modelCompleter.isCompleted) {
         modelCompleter.complete(modelAckSet);
       }
     }
@@ -708,23 +731,15 @@ class _HostSessionScreenState
     widget.mqttService.removeMessageListener('ack/mod', modelAckListener);
     if (!mounted) return;
     if (modelResult.isEmpty) {
-      // no clients acknowledged the model
-      // — return to idle
-      setState(() {
-        _isProcessingDistribution = false;
-        _distributionStep =
-            DistributionStep.idle;
-      });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(
+      // Continue as a host-only run rather than aborting all computation. The
+      // host can still share the dataset locally and execute the same job.
+      ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content:
-              Text(
-                'No ACKs received for model — aborting',
-              ),
+          content: Text(
+            'No client ACKed the model; continuing with host-only computation',
+          ),
         ),
       );
-      return;
     }
     // clients acknowledged the model —
     // mark model as shared, then start data sharing
@@ -745,25 +760,35 @@ class _HostSessionScreenState
     // notification targeted to that IP
     int success = 0;
     final List<String> failed = [];
-    for (final ip in modelResult) {
-      final ok =
-          await widget.mqttService
-              .shareFileToTopic(
+    if (modelResult.isEmpty) {
+      final ok = await widget.mqttService.shareFileToTopic(
         _selectedDatasetFile!,
         'dist/data',
-        targetIp: ip,
       );
       if (ok) {
         success++;
       } else {
-        failed.add(ip);
+        failed.add('broadcast');
       }
-      await Future.delayed(
-        const Duration(milliseconds: 200),
-      );
+    } else {
+      for (final clientTarget in modelResult) {
+        final ok = await widget.mqttService.shareFileToTopic(
+          _selectedDatasetFile!,
+          'dist/data',
+          targetIp: clientTarget,
+        );
+        if (ok) {
+          success++;
+        } else {
+          failed.add(clientTarget);
+        }
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
     }
-    // After sharing the dataset, attempt to
-    // register job options (units per assignment)
+    // Resolve the stable dataset job ID once, then use it for job options and
+    // host participation. FileServerService now preserves this ID for every
+    // targeted announcement of the same dataset.
+    String distributedJobId = 'demo_job';
     try {
       final base =
           widget.mqttService.serverUrl;
@@ -771,7 +796,6 @@ class _HostSessionScreenState
           Uri.parse('$base/files');
       final fr =
           await http.get(filesUrl);
-      String jobId = 'demo_job';
       if (fr.statusCode == 200) {
         final list =
             jsonDecode(fr.body)
@@ -782,30 +806,23 @@ class _HostSessionScreenState
                 .split('/')
                 .last ??
             '';
-        // try to find the most recent file
-        // matching the dataset filename
+        // Prefer an exact filename match; because /files intentionally exposes
+        // only the current shared file, fall back to its sole entry if names
+        // differ due to path normalization or MIME metadata.
         try {
-          final found =
-              list
-                  .cast<
-                      Map<String, dynamic>>()
-                  .reversed
-                  .firstWhere(
-                    (f) => f['name'] == name,
-                    orElse: () => {},
-                  );
-          if (
-            found.isNotEmpty &&
-            found['id'] != null
-          ) {
-            jobId =
-                found['id'] as String;
+          final files = list.cast<Map<String, dynamic>>();
+          final found = files.reversed.firstWhere(
+            (f) => f['name'] == name,
+            orElse: () => files.isNotEmpty ? files.last : <String, dynamic>{},
+          );
+          if (found['id'] is String && (found['id'] as String).isNotEmpty) {
+            distributedJobId = found['id'] as String;
           }
         } catch (_) {}
       }
       // The reset marks registered jobs inactive. Reactivate the
       // dataset job for this newly submitted experiment.
-      distributionManager.activateJob(jobId);
+      distributionManager.activateJob(distributedJobId);
 
       // post job options
       try {
@@ -815,7 +832,7 @@ class _HostSessionScreenState
             );
         final body =
             jsonEncode({
-          'job_id': jobId,
+          'job_id': distributedJobId,
           'default_max_units':
               _unitsPerAssignment,
         });
@@ -849,9 +866,7 @@ class _HostSessionScreenState
               );
       for (final m in existingD) {
         if (m.content.isNotEmpty) {
-          dataAckSet.add(
-            m.content.trim(),
-          );
+          dataAckSet.add(_ackTargetKey(m.content));
         }
       }
     } catch (_) {}
@@ -860,9 +875,7 @@ class _HostSessionScreenState
       String message,
     ) {
       if (message.isNotEmpty) {
-        dataAckSet.add(
-          message.trim(),
-        );
+        dataAckSet.add(_ackTargetKey(message));
       }
       if (
         dataAckSet.length >= modelResult.length &&
@@ -894,6 +907,19 @@ class _HostSessionScreenState
           'ack/data',
           dataAckListener,
         );
+
+    // The host is also a compute participant. Its warmup report registers it
+    // with DistributionManager if needed, then its worker polls the same job.
+    final hostStarted = await widget.mqttService.startHostWorker(
+      modelFile: _selectedModelFile!,
+      jobId: distributedJobId,
+    );
+    if (!hostStarted) {
+      widget.mqttService.messageLogger.log(
+        '⚠️ Host worker could not start for job $distributedJobId',
+      );
+    }
+
     if (!mounted) return;
     setState(() {
       _ackedDataIps.addAll(
@@ -1097,8 +1123,8 @@ class _HostSessionScreenState
                                 ),
                     child: Text(
                       _showModelIps
-                          ? 'Hide IPs'
-                          : 'Show IPs',
+                          ? 'Hide device IDs'
+                          : 'Show device IDs',
                     ),
                   ),
                 ),
@@ -1260,8 +1286,8 @@ class _HostSessionScreenState
                                 ),
                     child: Text(
                       _showDataIps
-                          ? 'Hide IPs'
-                          : 'Show IPs',
+                          ? 'Hide device IDs'
+                          : 'Show device IDs',
                     ),
                   ),
                 ),
@@ -1662,11 +1688,9 @@ class _HostSessionScreenState
                                           c.clientId ==
                                           clientId,
                                     );
-                            displayName =
-                                match.deviceName
-                                        .isNotEmpty
-                                    ? match.deviceName
-                                    : clientId;
+                            displayName = match.deviceName.isNotEmpty
+                                ? '${match.deviceName} (${match.ipAddress})'
+                                : clientId;
                           } catch (_) {
                             // fallback to full
                             // clientId when no friendly

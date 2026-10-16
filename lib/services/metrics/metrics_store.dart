@@ -8,15 +8,44 @@ import 'traffic_counter.dart';
 // Device identity helpers. Client ids look like
 // "mqtt_client_<DeviceName>_<BrokerIP>_<DeviceIP-with-dashes>".
 // ---------------------------------------------------------------------------
+bool _looksLikeDashedIpv4(String value) =>
+    RegExp(r'^\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$').hasMatch(value);
+
 String deviceKeyFromClientId(String clientId) {
   final parts = clientId.split('_');
-  if (parts.length >= 5) return parts.last.replaceAll('-', '.');
+  if (clientId.startsWith('mobitest_') && parts.length >= 5 &&
+      _looksLikeDashedIpv4(parts[parts.length - 2])) {
+    return parts[parts.length - 2].replaceAll('-', '.');
+  }
+  if (clientId.startsWith('mqtt_client_') && parts.length >= 5 &&
+      _looksLikeDashedIpv4(parts.last)) {
+    return parts.last.replaceAll('-', '.');
+  }
   return clientId;
 }
 
 String deviceNameFromClientId(String clientId) {
   final parts = clientId.split('_');
-  return parts.length >= 3 ? parts[2] : clientId;
+  if (clientId.startsWith('mobitest_') && parts.length >= 5) {
+    final hex = parts[1];
+    try {
+      final bytes = <int>[];
+      for (var i = 0; i + 1 < hex.length; i += 2) {
+        final byte = int.tryParse(hex.substring(i, i + 2), radix: 16);
+        if (byte == null) return clientId;
+        bytes.add(byte);
+      }
+      return utf8.decode(bytes, allowMalformed: true);
+    } catch (_) {
+      return clientId;
+    }
+  }
+  if (clientId.startsWith('mqtt_client_') && parts.length >= 5) {
+    // Legacy IDs can contain underscores in the device name; broker and device
+    // addresses are the final two fields, so keep everything between them.
+    return parts.sublist(2, parts.length - 2).join('_');
+  }
+  return clientId;
 }
 
 double _d(dynamic v, [double fallback = 0]) => v is num ? v.toDouble() : fallback;
