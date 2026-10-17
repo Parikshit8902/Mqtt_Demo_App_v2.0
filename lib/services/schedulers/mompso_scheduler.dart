@@ -72,6 +72,12 @@ class MOMPSOScheduler extends DynamicScheduler {
   /// Maximum number of solutions retained in the Pareto archive.
   final int archiveSize;
 
+  /// Optional read-only trace hook for benchmark diagnostics.
+  /// It does not affect random-number consumption or optimizer decisions.
+  final void Function(MOMPSOIterationDiagnostics snapshot)? onIterationDiagnostics;
+
+  int _optimizationCallIndex = 0;
+
   MOMPSOScheduler({
     super.random,
     super.config,
@@ -82,6 +88,7 @@ class MOMPSOScheduler extends DynamicScheduler {
     this.c2 = 1.49,
     this.maxVelocity = 4.0,
     this.archiveSize = 30,
+    this.onIterationDiagnostics,
   }) : assert(particles > 0),
        assert(iterations >= 0),
        assert(inertia >= 0),
@@ -96,12 +103,56 @@ class MOMPSOScheduler extends DynamicScheduler {
   @override
   String get label => 'MOMPSO';
 
-  /// Optimizes the current feasible batch and returns the assignment of the
-  /// first remaining unit.
+  /// Optimizes the schedulable batch once and returns the complete plan.
   ///
-  /// DynamicScheduler performs the actual assignment incrementally. Therefore
-  /// we optimize the largest currently feasible subset, then return only the
-  /// assignment for [remaining.first].
+  /// This keeps the assignment evaluated by MOMPSO intact when
+  /// DynamicScheduler commits the result. Using only [pickPair] would rerun
+  /// the optimizer after each committed task, so the final schedule could be
+  /// assembled from several different optimization snapshots and no longer
+  /// match any single archived batch solution.
+  @override
+  List<UnitPick>? planBatch(
+    FleetModel fleet,
+    List<Unit> remaining,
+    List<String> open,
+  ) {
+    if (remaining.isEmpty || open.isEmpty) return const <UnitPick>[];
+
+    final clientIds = List<String>.of(open)..sort();
+    final capacities = <int>[
+      for (final id in clientIds)
+        max(0, fleet.capFor(id) - fleet.views[id]!.assigned),
+    ];
+    final totalCapacity = capacities.fold<int>(
+      0,
+      (sum, capacity) => sum + capacity,
+    );
+    if (totalCapacity <= 0) return const <UnitPick>[];
+
+    final taskCount = min(remaining.length, totalCapacity);
+    final problem = _MOMPSOProblem(
+      fleet: fleet,
+      units: remaining.take(taskCount).toList(),
+      clientIds: clientIds,
+      capacities: capacities,
+    );
+    final best = _optimize(problem);
+
+    if (best.assignments.length != taskCount) {
+      throw StateError(
+        'MOMPSO produced ${best.assignments.length} assignments for '
+        '$taskCount schedulable tasks.',
+      );
+    }
+
+    return <UnitPick>[
+      for (var task = 0; task < taskCount; task++)
+        UnitPick(problem.units[task], clientIds[best.assignments[task]]),
+    ];
+  }
+
+  /// Compatibility path for callers that explicitly request one pair.
+  /// Normal batch scheduling uses [planBatch] above.
   @override
   UnitPick? pickPair(
     FleetModel fleet,
@@ -183,6 +234,7 @@ class MOMPSOScheduler extends DynamicScheduler {
   }
 
   ParetoSolution _optimize(_MOMPSOProblem problem) {
+    final optimizationCall = _optimizationCallIndex++;
     final taskCount = problem.units.length;
     final workerCount = problem.clientIds.length;
 
@@ -247,9 +299,21 @@ class MOMPSOScheduler extends DynamicScheduler {
       );
     }
 
+    final leaderCounts = <String, int>{};
+    _emitDiagnostics(
+      callIndex: optimizationCall,
+      iteration: 0,
+      archive: archive,
+      swarm: swarm,
+      leaderCounts: leaderCounts,
+    );
+
     for (var iteration = 0; iteration < iterations; iteration++) {
+      leaderCounts.clear();
       for (final particle in swarm) {
         final leader = archive.selectLeader(random);
+        final leaderKey = leader.assignments.join(',');
+        leaderCounts[leaderKey] = (leaderCounts[leaderKey] ?? 0) + 1;
 
         final probabilities = List.generate(
           taskCount,
@@ -321,6 +385,13 @@ class MOMPSOScheduler extends DynamicScheduler {
           ),
         );
       }
+      _emitDiagnostics(
+        callIndex: optimizationCall,
+        iteration: iteration + 1,
+        archive: archive,
+        swarm: swarm,
+        leaderCounts: leaderCounts,
+      );
     }
 
     if (archive.isEmpty) {
@@ -338,6 +409,32 @@ class MOMPSOScheduler extends DynamicScheduler {
     // For a deterministic application-level decision, use normalized
     // distance to the ideal point and select the closest solution.
     return _selectFinalSolution(archive.solutions);
+  }
+
+  void _emitDiagnostics({
+    required int callIndex,
+    required int iteration,
+    required ParetoArchive archive,
+    required List<_MOMPSOParticle> swarm,
+    required Map<String, int> leaderCounts,
+  }) {
+    final callback = onIterationDiagnostics;
+    if (callback == null) return;
+
+    final currentPositions = swarm.map((p) => p.position.join(',')).toSet();
+    final personalBestPositions =
+        swarm.map((p) => p.personalBestPosition.join(',')).toSet();
+
+    callback(
+      MOMPSOIterationDiagnostics(
+        optimizationCall: callIndex,
+        iteration: iteration,
+        archiveSolutions: archive.solutions,
+        uniqueCurrentAssignments: currentPositions.length,
+        uniquePersonalBestAssignments: personalBestPositions.length,
+        leaderSelectionCounts: Map<String, int>.unmodifiable(leaderCounts),
+      ),
+    );
   }
 
   /// Creates a random feasible assignment.
@@ -522,6 +619,27 @@ class MOMPSOScheduler extends DynamicScheduler {
     final z = exp(value);
     return z / (1.0 + z);
   }
+}
+
+/// Immutable per-iteration diagnostics for tests and benchmark tooling.
+/// Assignment keys in [leaderSelectionCounts] are comma-separated worker indices.
+class MOMPSOIterationDiagnostics {
+  final int optimizationCall;
+  final int iteration;
+  final List<ParetoSolution> archiveSolutions;
+  final int uniqueCurrentAssignments;
+  final int uniquePersonalBestAssignments;
+  final Map<String, int> leaderSelectionCounts;
+
+  MOMPSOIterationDiagnostics({
+    required this.optimizationCall,
+    required this.iteration,
+    required List<ParetoSolution> archiveSolutions,
+    required this.uniqueCurrentAssignments,
+    required this.uniquePersonalBestAssignments,
+    required Map<String, int> leaderSelectionCounts,
+  })  : archiveSolutions = List<ParetoSolution>.unmodifiable(archiveSolutions),
+        leaderSelectionCounts = Map<String, int>.unmodifiable(leaderSelectionCounts);
 }
 
 /// Optimization problem presented to MOMPSO.
